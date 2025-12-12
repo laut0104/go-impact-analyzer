@@ -198,3 +198,124 @@ func (s *SymbolAnalyzer) FileToPackagePath(filePath string) string {
 
 	return s.modulePath + "/" + filepath.ToSlash(relDir)
 }
+
+// FunctionRange represents the line range of a function or method
+type FunctionRange struct {
+	Name      string
+	StartLine int
+	EndLine   int
+}
+
+// ExtractFunctionRanges extracts all exported function/method ranges from a Go file
+func (s *SymbolAnalyzer) ExtractFunctionRanges(filePath string) ([]FunctionRange, error) {
+	file, err := parser.ParseFile(s.fset, filePath, nil, parser.ParseComments)
+	if err != nil {
+		return nil, err
+	}
+
+	var ranges []FunctionRange
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		funcDecl, ok := n.(*ast.FuncDecl)
+		if !ok {
+			return true
+		}
+
+		if funcDecl.Name == nil || !isExported(funcDecl.Name.Name) {
+			return true
+		}
+
+		startPos := s.fset.Position(funcDecl.Pos())
+		endPos := s.fset.Position(funcDecl.End())
+
+		ranges = append(ranges, FunctionRange{
+			Name:      funcDecl.Name.Name,
+			StartLine: startPos.Line,
+			EndLine:   endPos.Line,
+		})
+
+		return true
+	})
+
+	return ranges, nil
+}
+
+// ExtractTypeRanges extracts all exported type declaration ranges from a Go file
+func (s *SymbolAnalyzer) ExtractTypeRanges(filePath string) ([]FunctionRange, error) {
+	file, err := parser.ParseFile(s.fset, filePath, nil, parser.ParseComments)
+	if err != nil {
+		return nil, err
+	}
+
+	var ranges []FunctionRange
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		genDecl, ok := n.(*ast.GenDecl)
+		if !ok {
+			return true
+		}
+
+		for _, spec := range genDecl.Specs {
+			typeSpec, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+
+			if !isExported(typeSpec.Name.Name) {
+				continue
+			}
+
+			startPos := s.fset.Position(genDecl.Pos())
+			endPos := s.fset.Position(genDecl.End())
+
+			ranges = append(ranges, FunctionRange{
+				Name:      typeSpec.Name.Name,
+				StartLine: startPos.Line,
+				EndLine:   endPos.Line,
+			})
+		}
+
+		return true
+	})
+
+	return ranges, nil
+}
+
+// GetChangedSymbols returns the exported symbols that were modified based on changed line numbers
+func (s *SymbolAnalyzer) GetChangedSymbols(filePath string, changedLines []int) ([]string, error) {
+	if len(changedLines) == 0 {
+		return nil, nil
+	}
+
+	// Get function ranges
+	funcRanges, err := s.ExtractFunctionRanges(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get type ranges
+	typeRanges, err := s.ExtractTypeRanges(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	allRanges := append(funcRanges, typeRanges...)
+
+	// Find which symbols are affected by the changed lines
+	changedSymbols := make(map[string]bool)
+	for _, line := range changedLines {
+		for _, r := range allRanges {
+			if line >= r.StartLine && line <= r.EndLine {
+				changedSymbols[r.Name] = true
+			}
+		}
+	}
+
+	// Convert to slice
+	result := make([]string, 0, len(changedSymbols))
+	for sym := range changedSymbols {
+		result = append(result, sym)
+	}
+
+	return result, nil
+}
