@@ -16,6 +16,8 @@ type Config struct {
 	CmdDir string
 	// PathPrefix is removed from file paths when converting to package paths (default: "")
 	PathPrefix string
+	// BaseBranch is the base branch for git diff (e.g., "main", "origin/main")
+	BaseBranch string
 	// ExtractorOptions are options passed to ResourceExtractor
 	ExtractorOptions []ExtractorOption
 }
@@ -26,6 +28,7 @@ type Analyzer struct {
 	graph          *DependencyGraph
 	extractor      *ResourceExtractor
 	symbolAnalyzer *SymbolAnalyzer
+	diffAnalyzer   *DiffAnalyzer
 	resources      []Resource
 	// Package path -> resource names that depend on it
 	reverseDeps map[string][]string
@@ -36,12 +39,16 @@ func NewAnalyzer(cfg Config) *Analyzer {
 	if cfg.CmdDir == "" {
 		cfg.CmdDir = "cli/cmd"
 	}
+	if cfg.BaseBranch == "" {
+		cfg.BaseBranch = "origin/main"
+	}
 
 	return &Analyzer{
 		config:         cfg,
 		graph:          NewDependencyGraph(cfg.ModulePath),
 		extractor:      NewResourceExtractor(cfg.ModulePath, cfg.ExtractorOptions...),
 		symbolAnalyzer: NewSymbolAnalyzer(cfg.ModulePath, cfg.ProjectRoot),
+		diffAnalyzer:   NewDiffAnalyzer(cfg.ProjectRoot, cfg.BaseBranch),
 		reverseDeps:    make(map[string][]string),
 	}
 }
@@ -107,8 +114,13 @@ func (a *Analyzer) GetResources() []Resource {
 func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResource {
 	affectedMap := make(map[string]*AffectedResource)
 
-	// Group changed files by package
-	filesByPackage := make(map[string][]string)
+	// Group changed files by package with absolute paths
+	type fileInfo struct {
+		absPath  string
+		origPath string
+	}
+	filesByPackage := make(map[string][]fileInfo)
+
 	for _, file := range changedFiles {
 		pkgPath := a.fileToPackage(file)
 		if pkgPath == "" {
@@ -116,25 +128,45 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 		}
 		// Convert to absolute path for symbol extraction
 		absPath := file
+		origPath := file
 		if !filepath.IsAbs(file) {
+			pathWithoutPrefix := file
 			if a.config.PathPrefix != "" {
-				file = strings.TrimPrefix(file, a.config.PathPrefix)
+				pathWithoutPrefix = strings.TrimPrefix(file, a.config.PathPrefix)
 			}
-			absPath = filepath.Join(a.config.ProjectRoot, file)
+			absPath = filepath.Join(a.config.ProjectRoot, pathWithoutPrefix)
 		}
-		filesByPackage[pkgPath] = append(filesByPackage[pkgPath], absPath)
+		filesByPackage[pkgPath] = append(filesByPackage[pkgPath], fileInfo{absPath: absPath, origPath: origPath})
 	}
 
 	for pkgPath, files := range filesByPackage {
-		// Extract symbols from changed files
+		// Extract only the symbols that were actually changed (function-level)
 		var changedSymbols []string
-		for _, file := range files {
-			symbols, err := a.symbolAnalyzer.ExtractExportedSymbols(file)
+		for _, fi := range files {
+			// Get changed line numbers from git diff
+			changedLines, err := a.diffAnalyzer.GetChangedLines(fi.origPath)
+			if err != nil || len(changedLines) == 0 {
+				// Fallback: if we can't get diff info, use all exported symbols
+				symbols, err := a.symbolAnalyzer.ExtractExportedSymbols(fi.absPath)
+				if err == nil {
+					changedSymbols = append(changedSymbols, symbols...)
+				}
+				continue
+			}
+
+			// Get only the symbols that contain changed lines
+			symbols, err := a.symbolAnalyzer.GetChangedSymbols(fi.absPath, changedLines)
 			if err != nil {
+				// Fallback to all symbols on error
+				allSymbols, _ := a.symbolAnalyzer.ExtractExportedSymbols(fi.absPath)
+				changedSymbols = append(changedSymbols, allSymbols...)
 				continue
 			}
 			changedSymbols = append(changedSymbols, symbols...)
 		}
+
+		// Remove duplicates from changedSymbols
+		changedSymbols = uniqueStrings(changedSymbols)
 
 		// Get resources that depend on this package
 		resourceNames := a.reverseDeps[pkgPath]

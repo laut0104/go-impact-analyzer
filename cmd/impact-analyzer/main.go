@@ -67,6 +67,7 @@ func main() {
 		ProjectRoot: projectRoot,
 		CmdDir:      cmdDir,
 		PathPrefix:  pathPrefix,
+		BaseBranch:  baseBranch,
 	}
 	a := analyzer.NewAnalyzer(cfg)
 
