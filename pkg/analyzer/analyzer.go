@@ -22,10 +22,11 @@ type Config struct {
 
 // Analyzer analyzes dependencies and identifies affected resources
 type Analyzer struct {
-	config    Config
-	graph     *DependencyGraph
-	extractor *ResourceExtractor
-	resources []Resource
+	config         Config
+	graph          *DependencyGraph
+	extractor      *ResourceExtractor
+	symbolAnalyzer *SymbolAnalyzer
+	resources      []Resource
 	// Package path -> resource names that depend on it
 	reverseDeps map[string][]string
 }
@@ -37,10 +38,11 @@ func NewAnalyzer(cfg Config) *Analyzer {
 	}
 
 	return &Analyzer{
-		config:      cfg,
-		graph:       NewDependencyGraph(cfg.ModulePath),
-		extractor:   NewResourceExtractor(cfg.ModulePath, cfg.ExtractorOptions...),
-		reverseDeps: make(map[string][]string),
+		config:         cfg,
+		graph:          NewDependencyGraph(cfg.ModulePath),
+		extractor:      NewResourceExtractor(cfg.ModulePath, cfg.ExtractorOptions...),
+		symbolAnalyzer: NewSymbolAnalyzer(cfg.ModulePath, cfg.ProjectRoot),
+		reverseDeps:    make(map[string][]string),
 	}
 }
 
@@ -105,25 +107,55 @@ func (a *Analyzer) GetResources() []Resource {
 func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResource {
 	affectedMap := make(map[string]*AffectedResource)
 
+	// Group changed files by package
+	filesByPackage := make(map[string][]string)
 	for _, file := range changedFiles {
-		// Infer package path from file path
 		pkgPath := a.fileToPackage(file)
 		if pkgPath == "" {
 			continue
+		}
+		// Convert to absolute path for symbol extraction
+		absPath := file
+		if !filepath.IsAbs(file) {
+			if a.config.PathPrefix != "" {
+				file = strings.TrimPrefix(file, a.config.PathPrefix)
+			}
+			absPath = filepath.Join(a.config.ProjectRoot, file)
+		}
+		filesByPackage[pkgPath] = append(filesByPackage[pkgPath], absPath)
+	}
+
+	for pkgPath, files := range filesByPackage {
+		// Extract symbols from changed files
+		var changedSymbols []string
+		for _, file := range files {
+			symbols, err := a.symbolAnalyzer.ExtractExportedSymbols(file)
+			if err != nil {
+				continue
+			}
+			changedSymbols = append(changedSymbols, symbols...)
 		}
 
 		// Get resources that depend on this package
 		resourceNames := a.reverseDeps[pkgPath]
 		for _, name := range resourceNames {
-			if _, exists := affectedMap[name]; !exists {
-				resource := a.getResourceByName(name)
-				if resource != nil {
-					affectedMap[name] = &AffectedResource{
-						Resource:        *resource,
-						Reason:          fmt.Sprintf("depends on %s", pkgPath),
-						AffectedPackage: pkgPath,
-						DependencyChain: a.getDependencyChain(resource.Package, pkgPath),
-					}
+			if _, exists := affectedMap[name]; exists {
+				continue
+			}
+
+			resource := a.getResourceByName(name)
+			if resource == nil {
+				continue
+			}
+
+			// Check if the resource actually uses the changed symbols
+			isAffected := a.isResourceAffectedBySymbols(resource, pkgPath, changedSymbols)
+			if isAffected {
+				affectedMap[name] = &AffectedResource{
+					Resource:        *resource,
+					Reason:          fmt.Sprintf("depends on %s", pkgPath),
+					AffectedPackage: pkgPath,
+					DependencyChain: a.getDependencyChain(resource.Package, pkgPath),
 				}
 			}
 		}
@@ -134,6 +166,43 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 		result = append(result, *r)
 	}
 	return result
+}
+
+// isResourceAffectedBySymbols checks if a resource is actually affected by the changed symbols
+func (a *Analyzer) isResourceAffectedBySymbols(resource *Resource, changedPkgPath string, changedSymbols []string) bool {
+	// If there are no exported symbols changed, consider it not affected
+	// (internal changes that don't affect the public API)
+	if len(changedSymbols) == 0 {
+		return false
+	}
+
+	// Get the dependency chain from resource package to changed package
+	chain := a.getDependencyChain(resource.Package, changedPkgPath)
+	if len(chain) == 0 {
+		return false
+	}
+
+	// Check each package in the chain to see if it uses the changed symbols
+	// Start from the package that directly imports the changed package
+	for i := 0; i < len(chain)-1; i++ {
+		currentPkg := chain[i]
+		nextPkg := chain[i+1]
+
+		// If the next package is the changed package, check symbol usage
+		if nextPkg == changedPkgPath {
+			pkgDir := a.symbolAnalyzer.GetPackageDir(currentPkg)
+			usesSymbols, err := a.symbolAnalyzer.CheckSymbolUsage(pkgDir, changedPkgPath, changedSymbols)
+			if err != nil {
+				// On error, assume affected to be safe
+				return true
+			}
+			if usesSymbols {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // GetAffectedResourcesByPackage identifies resources affected by a package path
