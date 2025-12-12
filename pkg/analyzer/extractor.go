@@ -1,13 +1,12 @@
 package analyzer
 
 import (
-	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
+	"os"
 	"path/filepath"
 	"strings"
-
-	"golang.org/x/tools/go/packages"
 )
 
 // ResourceExtractor extracts resources from CLI command definitions
@@ -59,32 +58,29 @@ func NewResourceExtractor(modulePath string, opts ...ExtractorOption) *ResourceE
 
 // ExtractFromDir extracts resources from the specified directory
 func (e *ResourceExtractor) ExtractFromDir(dir string) ([]Resource, error) {
-	cfg := &packages.Config{
-		Mode: packages.NeedName | packages.NeedSyntax | packages.NeedTypes |
-			packages.NeedImports | packages.NeedFiles,
-		Dir:  dir,
-		Fset: e.fset,
-	}
-
-	pkgs, err := packages.Load(cfg, "./...")
-	if err != nil {
-		return nil, fmt.Errorf("failed to load packages: %w", err)
-	}
-
 	var resources []Resource
 
-	for _, pkg := range pkgs {
-		// Only target cmd packages
-		if !strings.HasSuffix(pkg.PkgPath, e.cmdPackageSuffix) {
+	// Parse only the target files (api.go, job.go, worker.go)
+	for fileName, resourceType := range e.resourceFileMap {
+		filePath := filepath.Join(dir, fileName)
+
+		// Check if file exists
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
 			continue
 		}
 
-		// Build import alias to path mapping
-		for _, file := range pkg.Syntax {
-			importMap := e.buildImportMap(file)
-			extracted := e.extractFromFile(file, importMap, pkg.GoFiles)
-			resources = append(resources, extracted...)
+		// Parse the file
+		file, err := parser.ParseFile(e.fset, filePath, nil, parser.ParseComments)
+		if err != nil {
+			continue
 		}
+
+		// Build import map
+		importMap := e.buildImportMap(file)
+
+		// Extract resources
+		extracted := e.extractFromFile(file, importMap, resourceType, filePath)
+		resources = append(resources, extracted...)
 	}
 
 	return resources, nil
@@ -120,16 +116,8 @@ func (e *ResourceExtractor) buildImportMap(file *ast.File) map[string]string {
 }
 
 // extractFromFile extracts resources from a file
-func (e *ResourceExtractor) extractFromFile(file *ast.File, importMap map[string]string, goFiles []string) []Resource {
+func (e *ResourceExtractor) extractFromFile(file *ast.File, importMap map[string]string, resourceType ResourceType, fileName string) []Resource {
 	var resources []Resource
-
-	// Determine resource type from filename
-	fileName := e.fset.Position(file.Pos()).Filename
-	resourceType := e.detectResourceType(fileName)
-
-	if resourceType == "" {
-		return resources
-	}
 
 	ast.Inspect(file, func(n ast.Node) bool {
 		// Look for &cobra.Command{...}
@@ -158,15 +146,6 @@ func (e *ResourceExtractor) extractFromFile(file *ast.File, importMap map[string
 	})
 
 	return resources
-}
-
-// detectResourceType determines resource type from filename
-func (e *ResourceExtractor) detectResourceType(fileName string) ResourceType {
-	base := filepath.Base(fileName)
-	if rt, ok := e.resourceFileMap[base]; ok {
-		return rt
-	}
-	return ""
 }
 
 // isCobraCommand checks if CompositeLit is a cobra.Command type
@@ -275,48 +254,4 @@ func (e *ResourceExtractor) extractPackageFromRunE(expr ast.Expr, importMap map[
 	})
 
 	return pkg
-}
-
-// ExtractImportedPackages extracts job/API related packages imported from CLI command files
-func (e *ResourceExtractor) ExtractImportedPackages(dir string) (map[string][]string, error) {
-	cfg := &packages.Config{
-		Mode: packages.NeedName | packages.NeedSyntax | packages.NeedImports,
-		Dir:  dir,
-		Fset: e.fset,
-	}
-
-	pkgs, err := packages.Load(cfg, "./...")
-	if err != nil {
-		return nil, fmt.Errorf("failed to load packages: %w", err)
-	}
-
-	result := make(map[string][]string)
-
-	for _, pkg := range pkgs {
-		if !strings.HasSuffix(pkg.PkgPath, e.cmdPackageSuffix) {
-			continue
-		}
-
-		for _, file := range pkg.Syntax {
-			fileName := e.fset.Position(file.Pos()).Filename
-			base := filepath.Base(fileName)
-
-			// Only target resource files
-			if _, ok := e.resourceFileMap[base]; !ok {
-				continue
-			}
-
-			var imports []string
-			for _, imp := range file.Imports {
-				path := strings.Trim(imp.Path.Value, `"`)
-				// Only packages within the project
-				if strings.HasPrefix(path, e.modulePath) {
-					imports = append(imports, path)
-				}
-			}
-			result[base] = imports
-		}
-	}
-
-	return result, nil
 }
