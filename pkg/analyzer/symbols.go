@@ -515,6 +515,8 @@ type ChangedSymbolInfo struct {
 	Symbols []string
 	// Changed interface methods
 	InterfaceMethods []InterfaceMethodRange
+	// HasUnexportedChanges indicates if unexported functions/methods were modified
+	HasUnexportedChanges bool
 }
 
 // GetChangedSymbolsDetailed returns detailed information about changed symbols including interface methods
@@ -535,6 +537,30 @@ func (s *SymbolAnalyzer) GetChangedSymbolsDetailed(filePath string, changedLines
 		return nil, err
 	}
 
+	// Check if any unexported symbols were changed
+	hasUnexportedChanges, err := s.HasUnexportedChanges(filePath, changedLines)
+	if err != nil {
+		hasUnexportedChanges = false
+	}
+
+	// If unexported functions were changed, add all exported symbols from the same file
+	// because exported functions may call the changed unexported functions
+	if hasUnexportedChanges {
+		allExported, err := s.ExtractExportedSymbols(filePath)
+		if err == nil {
+			// Add all exported symbols to the changed symbols list
+			symbolSet := make(map[string]bool)
+			for _, sym := range symbols {
+				symbolSet[sym] = true
+			}
+			for _, sym := range allExported {
+				if !symbolSet[sym] {
+					symbols = append(symbols, sym)
+				}
+			}
+		}
+	}
+
 	// Remove interface names from symbols if we have detailed method info
 	interfaceNames := make(map[string]bool)
 	for _, m := range methods {
@@ -549,7 +575,59 @@ func (s *SymbolAnalyzer) GetChangedSymbolsDetailed(filePath string, changedLines
 	}
 
 	return &ChangedSymbolInfo{
-		Symbols:          filteredSymbols,
-		InterfaceMethods: methods,
+		Symbols:              filteredSymbols,
+		InterfaceMethods:     methods,
+		HasUnexportedChanges: hasUnexportedChanges,
 	}, nil
+}
+
+// HasUnexportedChanges checks if any unexported functions/methods were modified
+func (s *SymbolAnalyzer) HasUnexportedChanges(filePath string, changedLines []int) (bool, error) {
+	if len(changedLines) == 0 {
+		return false, nil
+	}
+
+	file, err := parser.ParseFile(s.fset, filePath, nil, parser.ParseComments)
+	if err != nil {
+		return false, err
+	}
+
+	// Build a set of changed lines for quick lookup
+	changedLineSet := make(map[int]bool)
+	for _, line := range changedLines {
+		changedLineSet[line] = true
+	}
+
+	hasUnexported := false
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		if hasUnexported {
+			return false
+		}
+
+		funcDecl, ok := n.(*ast.FuncDecl)
+		if !ok {
+			return true
+		}
+
+		// Skip exported functions
+		if funcDecl.Name != nil && isExported(funcDecl.Name.Name) {
+			return true
+		}
+
+		// Check if this unexported function has changes
+		startPos := s.fset.Position(funcDecl.Pos())
+		endPos := s.fset.Position(funcDecl.End())
+
+		for line := startPos.Line; line <= endPos.Line; line++ {
+			if changedLineSet[line] {
+				hasUnexported = true
+				return false
+			}
+		}
+
+		return true
+	})
+
+	return hasUnexported, nil
 }

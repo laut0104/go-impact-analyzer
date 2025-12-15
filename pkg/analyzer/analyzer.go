@@ -112,8 +112,9 @@ func (a *Analyzer) GetResources() []Resource {
 
 // changedSymbolsInfo holds detailed information about changed symbols per package
 type changedSymbolsInfo struct {
-	symbols          []string
-	interfaceMethods []InterfaceMethodRange
+	symbols              []string
+	interfaceMethods     []InterfaceMethodRange
+	hasUnexportedChanges bool
 }
 
 // GetAffectedResources identifies resources affected by changed files
@@ -149,6 +150,7 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 		// Extract only the symbols that were actually changed (function-level)
 		var changedSymbols []string
 		var changedInterfaceMethods []InterfaceMethodRange
+		hasUnexportedChanges := false
 
 		for _, fi := range files {
 			// Get changed line numbers from git diff
@@ -172,6 +174,9 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 			}
 			changedSymbols = append(changedSymbols, symbolInfo.Symbols...)
 			changedInterfaceMethods = append(changedInterfaceMethods, symbolInfo.InterfaceMethods...)
+			if symbolInfo.HasUnexportedChanges {
+				hasUnexportedChanges = true
+			}
 		}
 
 		// Remove duplicates from changedSymbols
@@ -192,8 +197,9 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 
 			// Check if the resource actually uses the changed symbols or methods
 			symbolsInfo := changedSymbolsInfo{
-				symbols:          changedSymbols,
-				interfaceMethods: changedInterfaceMethods,
+				symbols:              changedSymbols,
+				interfaceMethods:     changedInterfaceMethods,
+				hasUnexportedChanges: hasUnexportedChanges,
 			}
 			isAffected := a.isResourceAffectedBySymbols(resource, pkgPath, symbolsInfo)
 			if isAffected {
@@ -231,7 +237,7 @@ func uniqueInterfaceMethods(methods []InterfaceMethodRange) []InterfaceMethodRan
 // isResourceAffectedBySymbols checks if a resource is actually affected by the changed symbols
 func (a *Analyzer) isResourceAffectedBySymbols(resource *Resource, changedPkgPath string, info changedSymbolsInfo) bool {
 	// If there are no exported symbols or interface methods changed, consider it not affected
-	// (internal changes that don't affect the public API)
+	// (Note: unexported changes are now handled by adding exported symbols from the same file)
 	if len(info.symbols) == 0 && len(info.interfaceMethods) == 0 {
 		return false
 	}
