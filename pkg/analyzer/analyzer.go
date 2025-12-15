@@ -2,6 +2,10 @@ package analyzer
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -266,6 +270,20 @@ func (a *Analyzer) isResourceAffectedBySymbols(resource *Resource, changedPkgPat
 		return true
 	}
 
+	// Special handling for DI provider packages (under pkg/provider/)
+	// For these packages, we check if the resource uses the interface that the provider provides,
+	// rather than checking the intermediate aggregation package (like job/provider)
+	if strings.Contains(changedPkgPath, "/pkg/provider/") {
+		return a.isResourceAffectedByProviderChange(resource, changedPkgPath, info)
+	}
+
+	// Special handling for aggregator provider packages (like job/provider)
+	// These packages aggregate multiple providers via fx.Options
+	// We need to identify which specific providers were changed and check if the resource uses them
+	if a.isAggregatorProviderPackage(changedPkgPath) {
+		return a.isResourceAffectedByAggregatorChange(resource, changedPkgPath, info)
+	}
+
 	// Get all packages that the resource depends on (including subpackages of the resource)
 	allDeps := a.graph.GetAllDeps(resource.Package)
 
@@ -293,81 +311,79 @@ func (a *Analyzer) isResourceAffectedBySymbols(resource *Resource, changedPkgPat
 			continue
 		}
 
-		// Find the package that directly imports the changed package
-		// This could be pkg itself or one of its dependencies
-		var directImporter string
+		// Find all packages that directly import the changed package
+		// This could be pkg itself or multiple of its dependencies
+		var directImporters []string
 
 		// Check if pkg directly imports the changed package
 		pkgDirectDeps := a.graph.GetDirectDeps(pkg)
 		for _, d := range pkgDirectDeps {
 			if d == changedPkgPath {
-				directImporter = pkg
+				directImporters = append(directImporters, pkg)
 				break
 			}
 		}
 
-		// If pkg doesn't directly import, find which of its dependencies does
-		if directImporter == "" {
-			for _, dep := range pkgDeps {
-				depDirectDeps := a.graph.GetDirectDeps(dep)
-				for _, d := range depDirectDeps {
-					if d == changedPkgPath {
-						directImporter = dep
-						break
-					}
-				}
-				if directImporter != "" {
+		// Find which of pkg's dependencies directly import the changed package
+		for _, dep := range pkgDeps {
+			depDirectDeps := a.graph.GetDirectDeps(dep)
+			for _, d := range depDirectDeps {
+				if d == changedPkgPath {
+					directImporters = append(directImporters, dep)
 					break
 				}
 			}
 		}
 
-		if directImporter == "" {
+		if len(directImporters) == 0 {
 			continue
 		}
 
-		pkgDir := a.symbolAnalyzer.GetPackageDir(directImporter)
+		// Check each direct importer for symbol usage
+		for _, directImporter := range directImporters {
+			pkgDir := a.symbolAnalyzer.GetPackageDir(directImporter)
 
-		// Check regular symbol usage
-		if len(info.symbols) > 0 {
-			usesSymbols, err := a.symbolAnalyzer.CheckSymbolUsage(pkgDir, changedPkgPath, info.symbols)
-			if err != nil {
-				continue
-			}
-			if usesSymbols {
-				// Additional check: if the direct importer is an intermediate package (not the package being checked),
-				// verify that the package being checked (or resource) actually uses the affected symbols from the direct importer
-				if directImporter != pkg {
-					// Get the affected exported symbols in the direct importer
-					affectedSymbolsInImporter := a.getAffectedExportedSymbols(directImporter, changedPkgPath, info.symbols)
-					if len(affectedSymbolsInImporter) > 0 {
-						// Check if pkg or resource uses any of the affected symbols from the direct importer
-						checkPkgDir := a.symbolAnalyzer.GetPackageDir(pkg)
-						usesAffected, _ := a.symbolAnalyzer.CheckSymbolUsage(checkPkgDir, directImporter, affectedSymbolsInImporter)
-						if !usesAffected {
-							resourcePkgDir := a.symbolAnalyzer.GetPackageDir(resource.Package)
-							usesAffectedFromResource, _ := a.symbolAnalyzer.CheckSymbolUsage(resourcePkgDir, directImporter, affectedSymbolsInImporter)
-							if !usesAffectedFromResource {
-								continue
-							}
-						}
-					} else {
-						// No affected symbols in the intermediate package
-						continue
-					}
+			// Check regular symbol usage
+			if len(info.symbols) > 0 {
+				usesSymbols, err := a.symbolAnalyzer.CheckSymbolUsage(pkgDir, changedPkgPath, info.symbols)
+				if err != nil {
+					continue
 				}
-				return true
+				if usesSymbols {
+					// Additional check: if the direct importer is an intermediate package (not the package being checked),
+					// verify that the package being checked (or resource) actually uses the affected symbols from the direct importer
+					if directImporter != pkg {
+						// Get the affected exported symbols in the direct importer
+						affectedSymbolsInImporter := a.getAffectedExportedSymbols(directImporter, changedPkgPath, info.symbols)
+						if len(affectedSymbolsInImporter) > 0 {
+							// Check if pkg or resource uses any of the affected symbols from the direct importer
+							checkPkgDir := a.symbolAnalyzer.GetPackageDir(pkg)
+							usesAffected, _ := a.symbolAnalyzer.CheckSymbolUsage(checkPkgDir, directImporter, affectedSymbolsInImporter)
+							if !usesAffected {
+								resourcePkgDir := a.symbolAnalyzer.GetPackageDir(resource.Package)
+								usesAffectedFromResource, _ := a.symbolAnalyzer.CheckSymbolUsage(resourcePkgDir, directImporter, affectedSymbolsInImporter)
+								if !usesAffectedFromResource {
+									continue
+								}
+							}
+						} else {
+							// No affected symbols in the intermediate package
+							continue
+						}
+					}
+					return true
+				}
 			}
-		}
 
-		// Check interface method usage
-		if len(info.interfaceMethods) > 0 {
-			usesMethods, err := a.symbolAnalyzer.CheckMethodCallUsage(pkgDir, changedPkgPath, info.interfaceMethods)
-			if err != nil {
-				continue
-			}
-			if usesMethods {
-				return true
+			// Check interface method usage
+			if len(info.interfaceMethods) > 0 {
+				usesMethods, err := a.symbolAnalyzer.CheckMethodCallUsage(pkgDir, changedPkgPath, info.interfaceMethods)
+				if err != nil {
+					continue
+				}
+				if usesMethods {
+					return true
+				}
 			}
 		}
 	}
@@ -395,7 +411,344 @@ func (a *Analyzer) getAffectedExportedSymbols(pkgPath, changedPkgPath string, ch
 		}
 	}
 
+	// If a factory function (like New) is affected, also include the interface it returns
+	// This is because changes to the implementation affect all code using the interface
+	if len(affectedSymbols) > 0 {
+		returnTypes := a.symbolAnalyzer.GetFactoryReturnTypes(pkgDir, affectedSymbols)
+		for _, rt := range returnTypes {
+			// Check if return type is an exported interface in this package
+			for _, sym := range allExportedSymbols {
+				if sym == rt && !contains(affectedSymbols, sym) {
+					affectedSymbols = append(affectedSymbols, sym)
+				}
+			}
+		}
+	}
+
 	return affectedSymbols
+}
+
+// contains checks if a string slice contains a value
+func contains(slice []string, val string) bool {
+	for _, s := range slice {
+		if s == val {
+			return true
+		}
+	}
+	return false
+}
+
+// isResourceAffectedByProviderChange checks if a resource is affected by changes to a DI provider package
+// For provider packages, we directly check if the resource uses the interface that the provider provides,
+// bypassing intermediate aggregation packages like job/provider
+func (a *Analyzer) isResourceAffectedByProviderChange(resource *Resource, changedPkgPath string, info changedSymbolsInfo) bool {
+	// Get the provider package directory
+	providerPkgDir := a.symbolAnalyzer.GetPackageDir(changedPkgPath)
+
+	// Find the interface types that this provider provides
+	// Provider packages typically have a New function that returns an interface
+	var providedInterfaces []string
+	for _, sym := range info.symbols {
+		returnTypes := a.symbolAnalyzer.GetFactoryReturnTypes(providerPkgDir, []string{sym})
+		providedInterfaces = append(providedInterfaces, returnTypes...)
+	}
+
+	// If no interfaces are provided, the provider may only have Provider variable changed
+	// In that case, we need to find what interface the New function returns
+	if len(providedInterfaces) == 0 {
+		returnTypes := a.symbolAnalyzer.GetFactoryReturnTypes(providerPkgDir, []string{"New"})
+		providedInterfaces = append(providedInterfaces, returnTypes...)
+	}
+
+	// If still no interfaces found, fall back to not affected (conservative for provider packages)
+	if len(providedInterfaces) == 0 {
+		return false
+	}
+
+	// Find the package that defines these interface types
+	// The provider typically imports and returns an interface from another package (e.g., mcm.MCMClient)
+	interfacePackages := a.findInterfaceDefinitionPackages(providerPkgDir, providedInterfaces)
+
+	// Check if the resource uses any of the provided interfaces
+	// We check the resource package and all its subpackages
+	allDeps := a.graph.GetAllDeps(resource.Package)
+	packagesToCheck := []string{resource.Package}
+	for _, dep := range allDeps {
+		if strings.HasPrefix(dep, resource.Package+"/") {
+			packagesToCheck = append(packagesToCheck, dep)
+		}
+	}
+
+	for _, pkg := range packagesToCheck {
+		pkgDir := a.symbolAnalyzer.GetPackageDir(pkg)
+
+		for interfacePkg, interfaceNames := range interfacePackages {
+			// Check if this package uses the provided interface via DI (struct fields, function params)
+			usesInterface, _ := a.diAnalyzer.CheckTypeUsage(pkgDir, interfacePkg, interfaceNames)
+			if usesInterface {
+				return true
+			}
+
+			// Also check direct symbol usage (for cases where the interface is used as a type annotation)
+			usesSymbol, _ := a.symbolAnalyzer.CheckSymbolUsage(pkgDir, interfacePkg, interfaceNames)
+			if usesSymbol {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// isAggregatorProviderPackage checks if a package is an aggregator provider package
+// Aggregator packages export fx.Options variables that combine multiple providers
+func (a *Analyzer) isAggregatorProviderPackage(pkgPath string) bool {
+	// Check common patterns for aggregator packages
+	// - job/provider
+	// - api-gateway/provider (but not api-gateway/provider/*)
+	// - Contains "provider" in path but not under pkg/provider/
+	if strings.Contains(pkgPath, "/pkg/provider/") {
+		return false
+	}
+
+	// Check if the path ends with "/provider" or contains "/provider/" followed by no more subdirs
+	parts := strings.Split(pkgPath, "/")
+	for i, part := range parts {
+		if part == "provider" {
+			// If "provider" is the last part, it's likely an aggregator
+			if i == len(parts)-1 {
+				return true
+			}
+			// If there's only "internal" after provider, also check
+			if i < len(parts)-1 && parts[i+1] == "internal" {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// isResourceAffectedByAggregatorChange checks if a resource is affected by changes to an aggregator provider package
+// It analyzes which providers were added/modified in the fx.Options and checks if the resource uses them
+func (a *Analyzer) isResourceAffectedByAggregatorChange(resource *Resource, changedPkgPath string, info changedSymbolsInfo) bool {
+	pkgDir := a.symbolAnalyzer.GetPackageDir(changedPkgPath)
+
+	// Parse the aggregator package to find fx.Options variables and their referenced providers
+	referencedProviders := a.extractReferencedProviders(pkgDir, info.symbols)
+
+	if len(referencedProviders) == 0 {
+		// If we can't determine which providers are referenced, fall back to checking
+		// if the resource uses any of the aggregator's direct dependencies
+		return false
+	}
+
+	// For each referenced provider package, check if the resource uses its provided interfaces
+	allDeps := a.graph.GetAllDeps(resource.Package)
+	packagesToCheck := []string{resource.Package}
+	for _, dep := range allDeps {
+		if strings.HasPrefix(dep, resource.Package+"/") {
+			packagesToCheck = append(packagesToCheck, dep)
+		}
+	}
+
+	for _, providerPkg := range referencedProviders {
+		// Get the interface that this provider provides
+		providerDir := a.symbolAnalyzer.GetPackageDir(providerPkg)
+		returnTypes := a.symbolAnalyzer.GetFactoryReturnTypes(providerDir, []string{"New"})
+
+		if len(returnTypes) == 0 {
+			continue
+		}
+
+		// Find where these interfaces are defined
+		interfacePackages := a.findInterfaceDefinitionPackages(providerDir, returnTypes)
+
+		// Check if the resource uses any of these interfaces
+		for _, pkg := range packagesToCheck {
+			checkPkgDir := a.symbolAnalyzer.GetPackageDir(pkg)
+
+			for interfacePkg, interfaceNames := range interfacePackages {
+				usesInterface, _ := a.diAnalyzer.CheckTypeUsage(checkPkgDir, interfacePkg, interfaceNames)
+				if usesInterface {
+					return true
+				}
+
+				usesSymbol, _ := a.symbolAnalyzer.CheckSymbolUsage(checkPkgDir, interfacePkg, interfaceNames)
+				if usesSymbol {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// extractReferencedProviders extracts provider package paths referenced in fx.Options variables
+func (a *Analyzer) extractReferencedProviders(pkgDir string, changedSymbols []string) []string {
+	var providers []string
+
+	entries, err := os.ReadDir(pkgDir)
+	if err != nil {
+		return providers
+	}
+
+	fset := token.NewFileSet()
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+
+		filePath := filepath.Join(pkgDir, entry.Name())
+		file, err := parser.ParseFile(fset, filePath, nil, 0)
+		if err != nil {
+			continue
+		}
+
+		// Build import map: alias -> full path
+		importMap := make(map[string]string)
+		for _, imp := range file.Imports {
+			path := strings.Trim(imp.Path.Value, `"`)
+			alias := ""
+			if imp.Name != nil {
+				alias = imp.Name.Name
+			} else {
+				parts := strings.Split(path, "/")
+				alias = parts[len(parts)-1]
+			}
+			importMap[alias] = path
+		}
+
+		// Find variable declarations (fx.Options)
+		for _, decl := range file.Decls {
+			genDecl, ok := decl.(*ast.GenDecl)
+			if !ok {
+				continue
+			}
+
+			for _, spec := range genDecl.Specs {
+				valueSpec, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+
+				// Check if this is one of the changed symbols
+				isChanged := len(changedSymbols) == 0 // If no specific symbols, check all
+				for _, name := range valueSpec.Names {
+					for _, changedSym := range changedSymbols {
+						if name.Name == changedSym {
+							isChanged = true
+							break
+						}
+					}
+				}
+
+				if !isChanged {
+					continue
+				}
+
+				// Extract provider references from the value (fx.Options(...))
+				for _, value := range valueSpec.Values {
+					a.extractProvidersFromExpr(value, importMap, &providers)
+				}
+			}
+		}
+	}
+
+	return uniqueStrings(providers)
+}
+
+// extractProvidersFromExpr recursively extracts provider package references from an expression
+func (a *Analyzer) extractProvidersFromExpr(expr ast.Expr, importMap map[string]string, providers *[]string) {
+	switch e := expr.(type) {
+	case *ast.CallExpr:
+		// fx.Options(...) or fx.Provide(...)
+		for _, arg := range e.Args {
+			a.extractProvidersFromExpr(arg, importMap, providers)
+		}
+	case *ast.SelectorExpr:
+		// pkg.Provider or pkg.New
+		if ident, ok := e.X.(*ast.Ident); ok {
+			if pkgPath, ok := importMap[ident.Name]; ok {
+				// Only include if it's a provider package (contains "provider" in path)
+				if strings.Contains(pkgPath, "provider") || e.Sel.Name == "Provider" {
+					*providers = append(*providers, pkgPath)
+				}
+			}
+		}
+	case *ast.Ident:
+		// Local reference (e.g., repository.Provider within the same package)
+		// Skip for now as it's internal
+	}
+}
+
+// findInterfaceDefinitionPackages finds the packages that define the given interface types
+// Returns a map of package path -> interface names
+func (a *Analyzer) findInterfaceDefinitionPackages(providerPkgDir string, interfaceNames []string) map[string][]string {
+	result := make(map[string][]string)
+
+	entries, err := os.ReadDir(providerPkgDir)
+	if err != nil {
+		return result
+	}
+
+	fset := token.NewFileSet()
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+
+		filePath := filepath.Join(providerPkgDir, entry.Name())
+		file, err := parser.ParseFile(fset, filePath, nil, 0)
+		if err != nil {
+			continue
+		}
+
+		// Build import map: alias -> full path
+		importMap := make(map[string]string)
+		for _, imp := range file.Imports {
+			path := strings.Trim(imp.Path.Value, `"`)
+			alias := ""
+			if imp.Name != nil {
+				alias = imp.Name.Name
+			} else {
+				parts := strings.Split(path, "/")
+				alias = parts[len(parts)-1]
+			}
+			importMap[alias] = path
+		}
+
+		// Find function declarations that return the target interface types
+		for _, decl := range file.Decls {
+			funcDecl, ok := decl.(*ast.FuncDecl)
+			if !ok || funcDecl.Type.Results == nil {
+				continue
+			}
+
+			for _, resultField := range funcDecl.Type.Results.List {
+				// Check if the return type is one of our interface names
+				switch t := resultField.Type.(type) {
+				case *ast.SelectorExpr:
+					// pkg.Type
+					if ident, ok := t.X.(*ast.Ident); ok {
+						typeName := t.Sel.Name
+						for _, ifaceName := range interfaceNames {
+							if typeName == ifaceName {
+								if pkgPath, ok := importMap[ident.Name]; ok {
+									result[pkgPath] = append(result[pkgPath], typeName)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return result
 }
 
 // GetAffectedResourcesByPackage identifies resources affected by a package path

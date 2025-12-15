@@ -775,3 +775,73 @@ func (s *SymbolAnalyzer) HasUnexportedChanges(filePath string, changedLines []in
 
 	return hasUnexported, nil
 }
+
+// GetFactoryReturnTypes extracts return types from factory functions (functions that return interfaces)
+func (s *SymbolAnalyzer) GetFactoryReturnTypes(pkgDir string, functionNames []string) []string {
+	entries, err := os.ReadDir(pkgDir)
+	if err != nil {
+		return nil
+	}
+
+	funcSet := make(map[string]bool)
+	for _, fn := range functionNames {
+		funcSet[fn] = true
+	}
+
+	var returnTypes []string
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+
+		filePath := filepath.Join(pkgDir, entry.Name())
+		file, err := parser.ParseFile(s.fset, filePath, nil, 0)
+		if err != nil {
+			continue
+		}
+
+		ast.Inspect(file, func(n ast.Node) bool {
+			funcDecl, ok := n.(*ast.FuncDecl)
+			if !ok {
+				return true
+			}
+
+			// Check if this is one of the target functions
+			if funcDecl.Name == nil || !funcSet[funcDecl.Name.Name] {
+				return true
+			}
+
+			// Get return types
+			if funcDecl.Type.Results != nil {
+				for _, result := range funcDecl.Type.Results.List {
+					// Extract type name
+					typeName := extractTypeName(result.Type)
+					if typeName != "" && isExported(typeName) {
+						returnTypes = append(returnTypes, typeName)
+					}
+				}
+			}
+
+			return true
+		})
+	}
+
+	return returnTypes
+}
+
+// extractTypeName extracts the type name from an ast.Expr
+func extractTypeName(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		// Pointer type - get the underlying type
+		return extractTypeName(t.X)
+	case *ast.SelectorExpr:
+		// Qualified type (pkg.Type) - return just the type name
+		return t.Sel.Name
+	default:
+		return ""
+	}
+}
