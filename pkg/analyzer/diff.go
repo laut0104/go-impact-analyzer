@@ -41,9 +41,33 @@ func (d *DiffAnalyzer) GetChangedLines(filePath string) ([]int, error) {
 		}
 	}
 
+	// Find git root directory
+	gitRootCmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	gitRootCmd.Dir = d.projectDir
+	gitRootOutput, err := gitRootCmd.Output()
+	if err != nil {
+		// Fallback to projectDir if git root cannot be found
+		gitRootOutput = []byte(d.projectDir)
+	}
+	gitRoot := strings.TrimSpace(string(gitRootOutput))
+
+	// Calculate relative path from project dir to git root
+	projectRelToGitRoot, err := filepath.Rel(gitRoot, d.projectDir)
+	if err != nil {
+		projectRelToGitRoot = ""
+	}
+
+	// Build the full relative path from git root
+	var gitRelPath string
+	if projectRelToGitRoot != "" && projectRelToGitRoot != "." {
+		gitRelPath = filepath.Join(projectRelToGitRoot, relPath)
+	} else {
+		gitRelPath = relPath
+	}
+
 	// Run git diff to get line-by-line changes
-	cmd := exec.Command("git", "diff", "-U0", d.baseBranch+"...HEAD", "--", relPath)
-	cmd.Dir = d.projectDir
+	cmd := exec.Command("git", "diff", "-U0", d.baseBranch+"...HEAD", "--", gitRelPath)
+	cmd.Dir = gitRoot
 
 	output, err := cmd.Output()
 	if err != nil {
