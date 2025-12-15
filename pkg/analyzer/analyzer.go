@@ -236,6 +236,12 @@ func (a *Analyzer) isResourceAffectedBySymbols(resource *Resource, changedPkgPat
 		return false
 	}
 
+	// If the changed package IS the resource's package (or a subpackage), it's always affected
+	// This handles cases where files are added/modified within the resource's own package
+	if resource.Package == changedPkgPath || strings.HasPrefix(changedPkgPath, resource.Package+"/") {
+		return true
+	}
+
 	// Get all packages that the resource depends on (including subpackages of the resource)
 	allDeps := a.graph.GetAllDeps(resource.Package)
 
