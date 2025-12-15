@@ -110,6 +110,12 @@ func (a *Analyzer) GetResources() []Resource {
 	return a.resources
 }
 
+// changedSymbolsInfo holds detailed information about changed symbols per package
+type changedSymbolsInfo struct {
+	symbols          []string
+	interfaceMethods []InterfaceMethodRange
+}
+
 // GetAffectedResources identifies resources affected by changed files
 func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResource {
 	affectedMap := make(map[string]*AffectedResource)
@@ -142,6 +148,8 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 	for pkgPath, files := range filesByPackage {
 		// Extract only the symbols that were actually changed (function-level)
 		var changedSymbols []string
+		var changedInterfaceMethods []InterfaceMethodRange
+
 		for _, fi := range files {
 			// Get changed line numbers from git diff
 			changedLines, err := a.diffAnalyzer.GetChangedLines(fi.origPath)
@@ -154,19 +162,21 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 				continue
 			}
 
-			// Get only the symbols that contain changed lines
-			symbols, err := a.symbolAnalyzer.GetChangedSymbols(fi.absPath, changedLines)
+			// Get detailed symbol info including interface methods
+			symbolInfo, err := a.symbolAnalyzer.GetChangedSymbolsDetailed(fi.absPath, changedLines)
 			if err != nil {
 				// Fallback to all symbols on error
 				allSymbols, _ := a.symbolAnalyzer.ExtractExportedSymbols(fi.absPath)
 				changedSymbols = append(changedSymbols, allSymbols...)
 				continue
 			}
-			changedSymbols = append(changedSymbols, symbols...)
+			changedSymbols = append(changedSymbols, symbolInfo.Symbols...)
+			changedInterfaceMethods = append(changedInterfaceMethods, symbolInfo.InterfaceMethods...)
 		}
 
 		// Remove duplicates from changedSymbols
 		changedSymbols = uniqueStrings(changedSymbols)
+		changedInterfaceMethods = uniqueInterfaceMethods(changedInterfaceMethods)
 
 		// Get resources that depend on this package
 		resourceNames := a.reverseDeps[pkgPath]
@@ -180,8 +190,12 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 				continue
 			}
 
-			// Check if the resource actually uses the changed symbols
-			isAffected := a.isResourceAffectedBySymbols(resource, pkgPath, changedSymbols)
+			// Check if the resource actually uses the changed symbols or methods
+			symbolsInfo := changedSymbolsInfo{
+				symbols:          changedSymbols,
+				interfaceMethods: changedInterfaceMethods,
+			}
+			isAffected := a.isResourceAffectedBySymbols(resource, pkgPath, symbolsInfo)
 			if isAffected {
 				affectedMap[name] = &AffectedResource{
 					Resource:        *resource,
@@ -200,35 +214,75 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 	return result
 }
 
+// uniqueInterfaceMethods removes duplicate interface methods
+func uniqueInterfaceMethods(methods []InterfaceMethodRange) []InterfaceMethodRange {
+	seen := make(map[string]bool)
+	result := make([]InterfaceMethodRange, 0, len(methods))
+	for _, m := range methods {
+		key := m.InterfaceName + "." + m.MethodName
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, m)
+		}
+	}
+	return result
+}
+
 // isResourceAffectedBySymbols checks if a resource is actually affected by the changed symbols
-func (a *Analyzer) isResourceAffectedBySymbols(resource *Resource, changedPkgPath string, changedSymbols []string) bool {
-	// If there are no exported symbols changed, consider it not affected
+func (a *Analyzer) isResourceAffectedBySymbols(resource *Resource, changedPkgPath string, info changedSymbolsInfo) bool {
+	// If there are no exported symbols or interface methods changed, consider it not affected
 	// (internal changes that don't affect the public API)
-	if len(changedSymbols) == 0 {
+	if len(info.symbols) == 0 && len(info.interfaceMethods) == 0 {
 		return false
 	}
 
-	// Get the dependency chain from resource package to changed package
-	chain := a.getDependencyChain(resource.Package, changedPkgPath)
-	if len(chain) == 0 {
-		return false
+	// Get all packages that the resource depends on (including subpackages of the resource)
+	allDeps := a.graph.GetAllDeps(resource.Package)
+
+	// Collect packages to check: resource package itself + all its dependencies that import the changed package
+	packagesToCheck := []string{resource.Package}
+	for _, dep := range allDeps {
+		// Check if this dependency is a subpackage of the resource (e.g., resource/job)
+		if strings.HasPrefix(dep, resource.Package+"/") {
+			packagesToCheck = append(packagesToCheck, dep)
+		}
 	}
 
-	// Check each package in the chain to see if it uses the changed symbols
-	// Start from the package that directly imports the changed package
-	for i := 0; i < len(chain)-1; i++ {
-		currentPkg := chain[i]
-		nextPkg := chain[i+1]
+	// Check each package for symbol usage
+	for _, pkg := range packagesToCheck {
+		// Verify that this package actually depends on the changed package
+		pkgDeps := a.graph.GetAllDeps(pkg)
+		dependsOnChanged := false
+		for _, d := range pkgDeps {
+			if d == changedPkgPath {
+				dependsOnChanged = true
+				break
+			}
+		}
+		if !dependsOnChanged {
+			continue
+		}
 
-		// If the next package is the changed package, check symbol usage
-		if nextPkg == changedPkgPath {
-			pkgDir := a.symbolAnalyzer.GetPackageDir(currentPkg)
-			usesSymbols, err := a.symbolAnalyzer.CheckSymbolUsage(pkgDir, changedPkgPath, changedSymbols)
+		pkgDir := a.symbolAnalyzer.GetPackageDir(pkg)
+
+		// Check regular symbol usage
+		if len(info.symbols) > 0 {
+			usesSymbols, err := a.symbolAnalyzer.CheckSymbolUsage(pkgDir, changedPkgPath, info.symbols)
 			if err != nil {
-				// On error, assume affected to be safe
-				return true
+				continue
 			}
 			if usesSymbols {
+				return true
+			}
+		}
+
+		// Check interface method usage
+		if len(info.interfaceMethods) > 0 {
+			usesMethods, err := a.symbolAnalyzer.CheckMethodCallUsage(pkgDir, changedPkgPath, info.interfaceMethods)
+			if err != nil {
+				continue
+			}
+			if usesMethods {
 				return true
 			}
 		}

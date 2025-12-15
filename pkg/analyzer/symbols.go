@@ -319,3 +319,237 @@ func (s *SymbolAnalyzer) GetChangedSymbols(filePath string, changedLines []int) 
 
 	return result, nil
 }
+
+// InterfaceMethodRange represents the line range of an interface method
+type InterfaceMethodRange struct {
+	InterfaceName string
+	MethodName    string
+	StartLine     int
+	EndLine       int
+}
+
+// ExtractInterfaceMethodRanges extracts all interface method ranges from a Go file
+func (s *SymbolAnalyzer) ExtractInterfaceMethodRanges(filePath string) ([]InterfaceMethodRange, error) {
+	file, err := parser.ParseFile(s.fset, filePath, nil, parser.ParseComments)
+	if err != nil {
+		return nil, err
+	}
+
+	var ranges []InterfaceMethodRange
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		genDecl, ok := n.(*ast.GenDecl)
+		if !ok {
+			return true
+		}
+
+		for _, spec := range genDecl.Specs {
+			typeSpec, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+
+			interfaceType, ok := typeSpec.Type.(*ast.InterfaceType)
+			if !ok {
+				continue
+			}
+
+			if !isExported(typeSpec.Name.Name) {
+				continue
+			}
+
+			// Extract methods from interface
+			for _, method := range interfaceType.Methods.List {
+				if len(method.Names) == 0 {
+					continue
+				}
+				methodName := method.Names[0].Name
+				if !isExported(methodName) {
+					continue
+				}
+
+				startPos := s.fset.Position(method.Pos())
+				endPos := s.fset.Position(method.End())
+
+				ranges = append(ranges, InterfaceMethodRange{
+					InterfaceName: typeSpec.Name.Name,
+					MethodName:    methodName,
+					StartLine:     startPos.Line,
+					EndLine:       endPos.Line,
+				})
+			}
+		}
+
+		return true
+	})
+
+	return ranges, nil
+}
+
+// GetChangedInterfaceMethods returns the interface methods that were modified based on changed line numbers
+func (s *SymbolAnalyzer) GetChangedInterfaceMethods(filePath string, changedLines []int) ([]InterfaceMethodRange, error) {
+	if len(changedLines) == 0 {
+		return nil, nil
+	}
+
+	methodRanges, err := s.ExtractInterfaceMethodRanges(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find which methods are affected by the changed lines
+	var changedMethods []InterfaceMethodRange
+	changedSet := make(map[string]bool)
+
+	for _, line := range changedLines {
+		for _, m := range methodRanges {
+			key := m.InterfaceName + "." + m.MethodName
+			if line >= m.StartLine && line <= m.EndLine && !changedSet[key] {
+				changedMethods = append(changedMethods, m)
+				changedSet[key] = true
+			}
+		}
+	}
+
+	return changedMethods, nil
+}
+
+// CheckMethodCallUsage checks if a package calls any of the given interface methods
+func (s *SymbolAnalyzer) CheckMethodCallUsage(pkgDir string, targetPkgPath string, methods []InterfaceMethodRange) (bool, error) {
+	if len(methods) == 0 {
+		return false, nil
+	}
+
+	// Build method set for quick lookup (just method names, since we check calls)
+	methodSet := make(map[string]bool)
+	for _, m := range methods {
+		methodSet[m.MethodName] = true
+	}
+
+	// Get target package alias from its path
+	targetPkgName := filepath.Base(targetPkgPath)
+
+	// Parse all Go files in the package directory
+	entries, err := os.ReadDir(pkgDir)
+	if err != nil {
+		return false, err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+
+		filePath := filepath.Join(pkgDir, entry.Name())
+		file, err := parser.ParseFile(s.fset, filePath, nil, 0)
+		if err != nil {
+			continue
+		}
+
+		// Find the import alias for the target package
+		importAlias := ""
+		for _, imp := range file.Imports {
+			impPath := strings.Trim(imp.Path.Value, `"`)
+			if impPath == targetPkgPath {
+				if imp.Name != nil {
+					importAlias = imp.Name.Name
+				} else {
+					importAlias = targetPkgName
+				}
+				break
+			}
+		}
+
+		// Only check files that import the target package
+		// This prevents false positives from methods with the same name on different interfaces
+		if importAlias == "" || importAlias == "_" {
+			continue
+		}
+
+		// Check for method calls
+		found := false
+		ast.Inspect(file, func(n ast.Node) bool {
+			if found {
+				return false
+			}
+
+			// Check for method call: obj.MethodName(...)
+			callExpr, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+
+			sel, ok := callExpr.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+
+			// Check if calling a method that matches our changed methods
+			if methodSet[sel.Sel.Name] {
+				// Direct package access: pkg.MethodName(...)
+				if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == importAlias {
+					found = true
+					return false
+				}
+				// Method call on variable (interface implementations)
+				// Since we confirmed this file imports the target package,
+				// we can assume the method call is related to that package
+				found = true
+				return false
+			}
+
+			return true
+		})
+
+		if found {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// ChangedSymbolInfo contains information about changed symbols including interface methods
+type ChangedSymbolInfo struct {
+	// Regular symbols (functions, types, etc.)
+	Symbols []string
+	// Changed interface methods
+	InterfaceMethods []InterfaceMethodRange
+}
+
+// GetChangedSymbolsDetailed returns detailed information about changed symbols including interface methods
+func (s *SymbolAnalyzer) GetChangedSymbolsDetailed(filePath string, changedLines []int) (*ChangedSymbolInfo, error) {
+	if len(changedLines) == 0 {
+		return &ChangedSymbolInfo{}, nil
+	}
+
+	// Get regular changed symbols
+	symbols, err := s.GetChangedSymbols(filePath, changedLines)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get changed interface methods
+	methods, err := s.GetChangedInterfaceMethods(filePath, changedLines)
+	if err != nil {
+		return nil, err
+	}
+
+	// Remove interface names from symbols if we have detailed method info
+	interfaceNames := make(map[string]bool)
+	for _, m := range methods {
+		interfaceNames[m.InterfaceName] = true
+	}
+
+	var filteredSymbols []string
+	for _, sym := range symbols {
+		if !interfaceNames[sym] {
+			filteredSymbols = append(filteredSymbols, sym)
+		}
+	}
+
+	return &ChangedSymbolInfo{
+		Symbols:          filteredSymbols,
+		InterfaceMethods: methods,
+	}, nil
+}
