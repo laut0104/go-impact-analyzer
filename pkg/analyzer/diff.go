@@ -60,7 +60,13 @@ func (d *DiffAnalyzer) GetChangedLines(filePath string) ([]int, error) {
 	// Build the full relative path from git root
 	var gitRelPath string
 	if projectRelToGitRoot != "" && projectRelToGitRoot != "." {
-		gitRelPath = filepath.Join(projectRelToGitRoot, relPath)
+		// Check if relPath already starts with the prefix (e.g., "go/")
+		// to avoid double prefixing like "go/go/..."
+		if strings.HasPrefix(relPath, projectRelToGitRoot+"/") {
+			gitRelPath = relPath
+		} else {
+			gitRelPath = filepath.Join(projectRelToGitRoot, relPath)
+		}
 	} else {
 		gitRelPath = relPath
 	}
