@@ -561,24 +561,168 @@ func (s *SymbolAnalyzer) GetChangedSymbolsDetailed(filePath string, changedLines
 		}
 	}
 
-	// Remove interface names from symbols if we have detailed method info
-	interfaceNames := make(map[string]bool)
-	for _, m := range methods {
-		interfaceNames[m.InterfaceName] = true
-	}
-
-	var filteredSymbols []string
-	for _, sym := range symbols {
-		if !interfaceNames[sym] {
-			filteredSymbols = append(filteredSymbols, sym)
-		}
-	}
+	// Keep interface names in symbols list since they represent type changes
+	// that affect code using the interface type
+	// (previously removed them, but we need to keep them for proper impact analysis)
 
 	return &ChangedSymbolInfo{
-		Symbols:              filteredSymbols,
+		Symbols:              symbols,
 		InterfaceMethods:     methods,
 		HasUnexportedChanges: hasUnexportedChanges,
 	}, nil
+}
+
+// ExtractAllExportedSymbolsFromDir extracts all exported symbols from all Go files in a directory
+func (s *SymbolAnalyzer) ExtractAllExportedSymbolsFromDir(pkgDir string) ([]string, error) {
+	entries, err := os.ReadDir(pkgDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var allSymbols []string
+	seen := make(map[string]bool)
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+
+		filePath := filepath.Join(pkgDir, entry.Name())
+		symbols, err := s.ExtractExportedSymbols(filePath)
+		if err != nil {
+			continue
+		}
+
+		for _, sym := range symbols {
+			if !seen[sym] {
+				seen[sym] = true
+				allSymbols = append(allSymbols, sym)
+			}
+		}
+	}
+
+	return allSymbols, nil
+}
+
+// CheckSymbolUsesSymbols checks if a specific symbol in a package uses any of the target symbols from another package
+func (s *SymbolAnalyzer) CheckSymbolUsesSymbols(pkgDir string, targetPkgPath string, targetSymbols []string, symbolName string) (bool, error) {
+	if len(targetSymbols) == 0 {
+		return false, nil
+	}
+
+	// Build symbol set for quick lookup
+	symbolSet := make(map[string]bool)
+	for _, sym := range targetSymbols {
+		symbolSet[sym] = true
+	}
+
+	// Get target package alias from its path
+	targetPkgName := filepath.Base(targetPkgPath)
+
+	// Parse all Go files in the package directory
+	entries, err := os.ReadDir(pkgDir)
+	if err != nil {
+		return false, err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+
+		filePath := filepath.Join(pkgDir, entry.Name())
+		file, err := parser.ParseFile(s.fset, filePath, nil, 0)
+		if err != nil {
+			continue
+		}
+
+		// Find the import alias for the target package
+		importAlias := ""
+		for _, imp := range file.Imports {
+			impPath := strings.Trim(imp.Path.Value, `"`)
+			if impPath == targetPkgPath {
+				if imp.Name != nil {
+					importAlias = imp.Name.Name
+				} else {
+					importAlias = targetPkgName
+				}
+				break
+			}
+		}
+
+		if importAlias == "" || importAlias == "_" {
+			continue
+		}
+
+		// Find the symbol (function, method, or type) in this file
+		var symbolNode ast.Node
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch decl := n.(type) {
+			case *ast.FuncDecl:
+				if decl.Name != nil && decl.Name.Name == symbolName {
+					symbolNode = decl
+					return false
+				}
+			case *ast.GenDecl:
+				for _, spec := range decl.Specs {
+					switch s := spec.(type) {
+					case *ast.TypeSpec:
+						if s.Name.Name == symbolName {
+							symbolNode = decl
+							return false
+						}
+					case *ast.ValueSpec:
+						for _, name := range s.Names {
+							if name.Name == symbolName {
+								symbolNode = decl
+								return false
+							}
+						}
+					}
+				}
+			}
+			return true
+		})
+
+		if symbolNode == nil {
+			continue
+		}
+
+		// Check if the symbol uses any of the target symbols
+		found := false
+		ast.Inspect(symbolNode, func(n ast.Node) bool {
+			if found {
+				return false
+			}
+
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+
+			ident, ok := sel.X.(*ast.Ident)
+			if !ok {
+				return true
+			}
+
+			// Check if it's accessing the target package
+			if ident.Name == importAlias {
+				// Check if the accessed symbol is in our list
+				if symbolSet[sel.Sel.Name] {
+					found = true
+					return false
+				}
+			}
+
+			return true
+		})
+
+		if found {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // HasUnexportedChanges checks if any unexported functions/methods were modified

@@ -29,6 +29,7 @@ type Analyzer struct {
 	extractor      *ResourceExtractor
 	symbolAnalyzer *SymbolAnalyzer
 	diffAnalyzer   *DiffAnalyzer
+	diAnalyzer     *DIAnalyzer
 	resources      []Resource
 	// Package path -> resource names that depend on it
 	reverseDeps map[string][]string
@@ -49,6 +50,7 @@ func NewAnalyzer(cfg Config) *Analyzer {
 		extractor:      NewResourceExtractor(cfg.ModulePath, cfg.ExtractorOptions...),
 		symbolAnalyzer: NewSymbolAnalyzer(cfg.ModulePath, cfg.ProjectRoot),
 		diffAnalyzer:   NewDiffAnalyzer(cfg.ProjectRoot, cfg.BaseBranch),
+		diAnalyzer:     NewDIAnalyzer(cfg.ModulePath, cfg.ProjectRoot),
 		reverseDeps:    make(map[string][]string),
 	}
 }
@@ -183,6 +185,22 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 		changedSymbols = uniqueStrings(changedSymbols)
 		changedInterfaceMethods = uniqueInterfaceMethods(changedInterfaceMethods)
 
+		// Remove interface names from changedSymbols if we have specific method info
+		// This prevents false positives where a resource uses the interface type but not the changed methods
+		if len(changedInterfaceMethods) > 0 {
+			interfaceNames := make(map[string]bool)
+			for _, m := range changedInterfaceMethods {
+				interfaceNames[m.InterfaceName] = true
+			}
+			var filteredSymbols []string
+			for _, sym := range changedSymbols {
+				if !interfaceNames[sym] {
+					filteredSymbols = append(filteredSymbols, sym)
+				}
+			}
+			changedSymbols = filteredSymbols
+		}
+
 		// Get resources that depend on this package
 		resourceNames := a.reverseDeps[pkgPath]
 		for _, name := range resourceNames {
@@ -251,7 +269,7 @@ func (a *Analyzer) isResourceAffectedBySymbols(resource *Resource, changedPkgPat
 	// Get all packages that the resource depends on (including subpackages of the resource)
 	allDeps := a.graph.GetAllDeps(resource.Package)
 
-	// Collect packages to check: resource package itself + all its dependencies that import the changed package
+	// Collect packages to check: resource package itself + all its subpackages
 	packagesToCheck := []string{resource.Package}
 	for _, dep := range allDeps {
 		// Check if this dependency is a subpackage of the resource (e.g., resource/job)
@@ -262,7 +280,7 @@ func (a *Analyzer) isResourceAffectedBySymbols(resource *Resource, changedPkgPat
 
 	// Check each package for symbol usage
 	for _, pkg := range packagesToCheck {
-		// Verify that this package actually depends on the changed package
+		// Verify that this package depends on the changed package (directly or transitively)
 		pkgDeps := a.graph.GetAllDeps(pkg)
 		dependsOnChanged := false
 		for _, d := range pkgDeps {
@@ -275,7 +293,40 @@ func (a *Analyzer) isResourceAffectedBySymbols(resource *Resource, changedPkgPat
 			continue
 		}
 
-		pkgDir := a.symbolAnalyzer.GetPackageDir(pkg)
+		// Find the package that directly imports the changed package
+		// This could be pkg itself or one of its dependencies
+		var directImporter string
+
+		// Check if pkg directly imports the changed package
+		pkgDirectDeps := a.graph.GetDirectDeps(pkg)
+		for _, d := range pkgDirectDeps {
+			if d == changedPkgPath {
+				directImporter = pkg
+				break
+			}
+		}
+
+		// If pkg doesn't directly import, find which of its dependencies does
+		if directImporter == "" {
+			for _, dep := range pkgDeps {
+				depDirectDeps := a.graph.GetDirectDeps(dep)
+				for _, d := range depDirectDeps {
+					if d == changedPkgPath {
+						directImporter = dep
+						break
+					}
+				}
+				if directImporter != "" {
+					break
+				}
+			}
+		}
+
+		if directImporter == "" {
+			continue
+		}
+
+		pkgDir := a.symbolAnalyzer.GetPackageDir(directImporter)
 
 		// Check regular symbol usage
 		if len(info.symbols) > 0 {
@@ -284,6 +335,27 @@ func (a *Analyzer) isResourceAffectedBySymbols(resource *Resource, changedPkgPat
 				continue
 			}
 			if usesSymbols {
+				// Additional check: if the direct importer is an intermediate package (not the package being checked),
+				// verify that the package being checked (or resource) actually uses the affected symbols from the direct importer
+				if directImporter != pkg {
+					// Get the affected exported symbols in the direct importer
+					affectedSymbolsInImporter := a.getAffectedExportedSymbols(directImporter, changedPkgPath, info.symbols)
+					if len(affectedSymbolsInImporter) > 0 {
+						// Check if pkg or resource uses any of the affected symbols from the direct importer
+						checkPkgDir := a.symbolAnalyzer.GetPackageDir(pkg)
+						usesAffected, _ := a.symbolAnalyzer.CheckSymbolUsage(checkPkgDir, directImporter, affectedSymbolsInImporter)
+						if !usesAffected {
+							resourcePkgDir := a.symbolAnalyzer.GetPackageDir(resource.Package)
+							usesAffectedFromResource, _ := a.symbolAnalyzer.CheckSymbolUsage(resourcePkgDir, directImporter, affectedSymbolsInImporter)
+							if !usesAffectedFromResource {
+								continue
+							}
+						}
+					} else {
+						// No affected symbols in the intermediate package
+						continue
+					}
+				}
 				return true
 			}
 		}
@@ -301,6 +373,29 @@ func (a *Analyzer) isResourceAffectedBySymbols(resource *Resource, changedPkgPat
 	}
 
 	return false
+}
+
+// getAffectedExportedSymbols finds exported symbols in a package that use the changed symbols from another package
+func (a *Analyzer) getAffectedExportedSymbols(pkgPath, changedPkgPath string, changedSymbols []string) []string {
+	pkgDir := a.symbolAnalyzer.GetPackageDir(pkgPath)
+
+	// Get all exported symbols in the package
+	allExportedSymbols, err := a.symbolAnalyzer.ExtractAllExportedSymbolsFromDir(pkgDir)
+	if err != nil {
+		return nil
+	}
+
+	// For each exported symbol, check if it uses any of the changed symbols
+	var affectedSymbols []string
+	for _, sym := range allExportedSymbols {
+		// Check if this symbol's implementation uses any of the changed symbols
+		usesChanged, _ := a.symbolAnalyzer.CheckSymbolUsesSymbols(pkgDir, changedPkgPath, changedSymbols, sym)
+		if usesChanged {
+			affectedSymbols = append(affectedSymbols, sym)
+		}
+	}
+
+	return affectedSymbols
 }
 
 // GetAffectedResourcesByPackage identifies resources affected by a package path
