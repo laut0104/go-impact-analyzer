@@ -845,3 +845,84 @@ func extractTypeName(expr ast.Expr) string {
 		return ""
 	}
 }
+
+// CheckSymbolUsesInterfaceMethods checks if a specific symbol in a package calls any of the target interface methods
+func (s *SymbolAnalyzer) CheckSymbolUsesInterfaceMethods(pkgDir string, targetPkgPath string, methods []InterfaceMethodRange, symbolName string) (bool, error) {
+	if len(methods) == 0 {
+		return false, nil
+	}
+
+	// Build method set for quick lookup
+	methodSet := make(map[string]bool)
+	for _, m := range methods {
+		methodSet[m.MethodName] = true
+	}
+
+	// Parse all Go files in the package directory
+	entries, err := os.ReadDir(pkgDir)
+	if err != nil {
+		return false, err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+
+		filePath := filepath.Join(pkgDir, entry.Name())
+		file, err := parser.ParseFile(s.fset, filePath, nil, 0)
+		if err != nil {
+			continue
+		}
+
+		// Find the symbol (function or method) in this file
+		var symbolNode ast.Node
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch decl := n.(type) {
+			case *ast.FuncDecl:
+				if decl.Name != nil && decl.Name.Name == symbolName {
+					symbolNode = decl
+					return false
+				}
+			}
+			return true
+		})
+
+		if symbolNode == nil {
+			continue
+		}
+
+		// Check if the symbol calls any of the target methods
+		found := false
+		ast.Inspect(symbolNode, func(n ast.Node) bool {
+			if found {
+				return false
+			}
+
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+
+			// Check for method call: x.MethodName()
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+
+			// Check if the method name matches
+			if methodSet[sel.Sel.Name] {
+				found = true
+				return false
+			}
+
+			return true
+		})
+
+		if found {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
