@@ -24,6 +24,10 @@ type Config struct {
 	BaseBranch string
 	// ExtractorOptions are options passed to ResourceExtractor
 	ExtractorOptions []ExtractorOption
+	// InfrastructureFiles are files that should be treated as infrastructure files
+	// Changes to these files alone don't affect resources unless the exported symbols they define are used
+	// Example: ["sqlc/db.go", "sqlc/models.go"]
+	InfrastructureFiles []string
 }
 
 // Analyzer analyzes dependencies and identifies affected resources
@@ -129,8 +133,9 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 
 	// Group changed files by package with absolute paths
 	type fileInfo struct {
-		absPath  string
-		origPath string
+		absPath          string
+		origPath         string
+		isInfrastructure bool
 	}
 	filesByPackage := make(map[string][]fileInfo)
 
@@ -149,14 +154,30 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 			}
 			absPath = filepath.Join(a.config.ProjectRoot, pathWithoutPrefix)
 		}
-		filesByPackage[pkgPath] = append(filesByPackage[pkgPath], fileInfo{absPath: absPath, origPath: origPath})
+		// Check if this is an infrastructure file
+		isInfra := a.isInfrastructureFile(file)
+		filesByPackage[pkgPath] = append(filesByPackage[pkgPath], fileInfo{absPath: absPath, origPath: origPath, isInfrastructure: isInfra})
 	}
 
 	for pkgPath, files := range filesByPackage {
+		// Check if all files in this package are infrastructure files
+		allInfrastructure := true
+		hasNonInfraFiles := false
+		for _, fi := range files {
+			if !fi.isInfrastructure {
+				allInfrastructure = false
+				hasNonInfraFiles = true
+				break
+			}
+		}
+
 		// Extract only the symbols that were actually changed (function-level)
 		var changedSymbols []string
 		var changedInterfaceMethods []InterfaceMethodRange
 		hasUnexportedChanges := false
+
+		// Track symbols from infrastructure files separately
+		var infraSymbols []string
 
 		for _, fi := range files {
 			// Get changed line numbers from git diff
@@ -165,7 +186,11 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 				// Fallback: if we can't get diff info, use all exported symbols
 				symbols, err := a.symbolAnalyzer.ExtractExportedSymbols(fi.absPath)
 				if err == nil {
-					changedSymbols = append(changedSymbols, symbols...)
+					if fi.isInfrastructure {
+						infraSymbols = append(infraSymbols, symbols...)
+					} else {
+						changedSymbols = append(changedSymbols, symbols...)
+					}
 				}
 				continue
 			}
@@ -175,14 +200,30 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 			if err != nil {
 				// Fallback to all symbols on error
 				allSymbols, _ := a.symbolAnalyzer.ExtractExportedSymbols(fi.absPath)
-				changedSymbols = append(changedSymbols, allSymbols...)
+				if fi.isInfrastructure {
+					infraSymbols = append(infraSymbols, allSymbols...)
+				} else {
+					changedSymbols = append(changedSymbols, allSymbols...)
+				}
 				continue
 			}
-			changedSymbols = append(changedSymbols, symbolInfo.Symbols...)
-			changedInterfaceMethods = append(changedInterfaceMethods, symbolInfo.InterfaceMethods...)
-			if symbolInfo.HasUnexportedChanges {
-				hasUnexportedChanges = true
+
+			if fi.isInfrastructure {
+				infraSymbols = append(infraSymbols, symbolInfo.Symbols...)
+			} else {
+				changedSymbols = append(changedSymbols, symbolInfo.Symbols...)
+				changedInterfaceMethods = append(changedInterfaceMethods, symbolInfo.InterfaceMethods...)
+				if symbolInfo.HasUnexportedChanges {
+					hasUnexportedChanges = true
+				}
 			}
+		}
+
+		// If all files are infrastructure files and no non-infra files changed,
+		// we need to find which resources actually use the changed symbols from infra files
+		if allInfrastructure && !hasNonInfraFiles && len(infraSymbols) > 0 {
+			// Use infra symbols for checking but with more strict symbol-level matching
+			changedSymbols = infraSymbols
 		}
 
 		// Remove duplicates from changedSymbols
@@ -382,6 +423,27 @@ func (a *Analyzer) isResourceAffectedBySymbols(resource *Resource, changedPkgPat
 					continue
 				}
 				if usesMethods {
+					// Additional check: if the direct importer is an intermediate package,
+					// verify that the resource actually uses the affected symbols from the direct importer
+					if directImporter != pkg {
+						// Get the affected exported symbols in the direct importer that use the changed interface methods
+						affectedSymbolsInImporter := a.getAffectedExportedSymbolsByMethods(directImporter, changedPkgPath, info.interfaceMethods)
+						if len(affectedSymbolsInImporter) > 0 {
+							// Check if pkg or resource uses any of the affected symbols from the direct importer
+							checkPkgDir := a.symbolAnalyzer.GetPackageDir(pkg)
+							usesAffected, _ := a.symbolAnalyzer.CheckSymbolUsage(checkPkgDir, directImporter, affectedSymbolsInImporter)
+							if !usesAffected {
+								resourcePkgDir := a.symbolAnalyzer.GetPackageDir(resource.Package)
+								usesAffectedFromResource, _ := a.symbolAnalyzer.CheckSymbolUsage(resourcePkgDir, directImporter, affectedSymbolsInImporter)
+								if !usesAffectedFromResource {
+									continue
+								}
+							}
+						} else {
+							// No affected symbols in the intermediate package
+							continue
+						}
+					}
 					return true
 				}
 			}
@@ -436,6 +498,41 @@ func contains(slice []string, val string) bool {
 		}
 	}
 	return false
+}
+
+// getAffectedExportedSymbolsByMethods finds exported symbols in a package that call the changed interface methods
+func (a *Analyzer) getAffectedExportedSymbolsByMethods(pkgPath, changedPkgPath string, changedMethods []InterfaceMethodRange) []string {
+	pkgDir := a.symbolAnalyzer.GetPackageDir(pkgPath)
+
+	// Get all exported symbols in the package
+	allExportedSymbols, err := a.symbolAnalyzer.ExtractAllExportedSymbolsFromDir(pkgDir)
+	if err != nil {
+		return nil
+	}
+
+	// For each exported symbol, check if it calls any of the changed interface methods
+	var affectedSymbols []string
+	for _, sym := range allExportedSymbols {
+		// Check if this symbol's implementation calls any of the changed methods
+		usesMethods, _ := a.symbolAnalyzer.CheckSymbolUsesInterfaceMethods(pkgDir, changedPkgPath, changedMethods, sym)
+		if usesMethods {
+			affectedSymbols = append(affectedSymbols, sym)
+		}
+	}
+
+	// If a factory function (like New) is affected, also include the interface it returns
+	if len(affectedSymbols) > 0 {
+		returnTypes := a.symbolAnalyzer.GetFactoryReturnTypes(pkgDir, affectedSymbols)
+		for _, rt := range returnTypes {
+			for _, sym := range allExportedSymbols {
+				if sym == rt && !contains(affectedSymbols, sym) {
+					affectedSymbols = append(affectedSymbols, sym)
+				}
+			}
+		}
+	}
+
+	return affectedSymbols
 }
 
 // isResourceAffectedByProviderChange checks if a resource is affected by changes to a DI provider package
@@ -880,4 +977,41 @@ func uniqueStrings(s []string) []string {
 		}
 	}
 	return result
+}
+
+// isInfrastructureFile checks if a file is an infrastructure file
+// Infrastructure files are common files that many resources depend on,
+// but changes to them should only affect resources that use the specific changed symbols
+func (a *Analyzer) isInfrastructureFile(filePath string) bool {
+	// Normalize the file path
+	normalizedPath := filepath.ToSlash(filePath)
+
+	// Remove path prefix if present
+	if a.config.PathPrefix != "" {
+		normalizedPath = strings.TrimPrefix(normalizedPath, a.config.PathPrefix)
+	}
+
+	// Check against configured infrastructure files
+	for _, infraFile := range a.config.InfrastructureFiles {
+		infraNormalized := filepath.ToSlash(infraFile)
+		if normalizedPath == infraNormalized || strings.HasSuffix(normalizedPath, "/"+infraNormalized) {
+			return true
+		}
+	}
+
+	// Default infrastructure file patterns
+	// These are auto-generated files that define shared types/infrastructure
+	defaultInfraPatterns := []string{
+		"sqlc/db.go",
+		"sqlc/models.go",
+		"sqlc/querier.go",
+	}
+
+	for _, pattern := range defaultInfraPatterns {
+		if normalizedPath == pattern || strings.HasSuffix(normalizedPath, "/"+pattern) {
+			return true
+		}
+	}
+
+	return false
 }
