@@ -281,6 +281,55 @@ func (s *SymbolAnalyzer) ExtractTypeRanges(filePath string) ([]FunctionRange, er
 	return ranges, nil
 }
 
+// ExtractConstantRanges extracts all exported constant/variable declaration ranges from a Go file
+func (s *SymbolAnalyzer) ExtractConstantRanges(filePath string) ([]FunctionRange, error) {
+	file, err := parser.ParseFile(s.fset, filePath, nil, parser.ParseComments)
+	if err != nil {
+		return nil, err
+	}
+
+	var ranges []FunctionRange
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		genDecl, ok := n.(*ast.GenDecl)
+		if !ok {
+			return true
+		}
+
+		// Only process const and var declarations
+		if genDecl.Tok != token.CONST && genDecl.Tok != token.VAR {
+			return true
+		}
+
+		for _, spec := range genDecl.Specs {
+			valueSpec, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+
+			for _, name := range valueSpec.Names {
+				if !isExported(name.Name) {
+					continue
+				}
+
+				// Use the spec's position for individual constants within a block
+				startPos := s.fset.Position(valueSpec.Pos())
+				endPos := s.fset.Position(valueSpec.End())
+
+				ranges = append(ranges, FunctionRange{
+					Name:      name.Name,
+					StartLine: startPos.Line,
+					EndLine:   endPos.Line,
+				})
+			}
+		}
+
+		return true
+	})
+
+	return ranges, nil
+}
+
 // GetChangedSymbols returns the exported symbols that were modified based on changed line numbers
 func (s *SymbolAnalyzer) GetChangedSymbols(filePath string, changedLines []int) ([]string, error) {
 	if len(changedLines) == 0 {
@@ -299,7 +348,14 @@ func (s *SymbolAnalyzer) GetChangedSymbols(filePath string, changedLines []int) 
 		return nil, err
 	}
 
+	// Get constant/variable ranges
+	constRanges, err := s.ExtractConstantRanges(filePath)
+	if err != nil {
+		return nil, err
+	}
+
 	allRanges := append(funcRanges, typeRanges...)
+	allRanges = append(allRanges, constRanges...)
 
 	// Find which symbols are affected by the changed lines
 	changedSymbols := make(map[string]bool)
