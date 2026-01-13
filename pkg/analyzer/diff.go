@@ -31,11 +31,21 @@ type FileChanges struct {
 
 // GetChangedLines extracts changed line numbers for a specific file using git diff
 func (d *DiffAnalyzer) GetChangedLines(filePath string) ([]int, error) {
+	// Ensure projectDir is absolute
+	projectDir := d.projectDir
+	if !filepath.IsAbs(projectDir) {
+		var err error
+		projectDir, err = filepath.Abs(projectDir)
+		if err != nil {
+			projectDir = d.projectDir
+		}
+	}
+
 	// Convert to relative path if absolute
 	relPath := filePath
 	if filepath.IsAbs(filePath) {
 		var err error
-		relPath, err = filepath.Rel(d.projectDir, filePath)
+		relPath, err = filepath.Rel(projectDir, filePath)
 		if err != nil {
 			relPath = filePath
 		}
@@ -43,16 +53,16 @@ func (d *DiffAnalyzer) GetChangedLines(filePath string) ([]int, error) {
 
 	// Find git root directory
 	gitRootCmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	gitRootCmd.Dir = d.projectDir
+	gitRootCmd.Dir = projectDir
 	gitRootOutput, err := gitRootCmd.Output()
 	if err != nil {
 		// Fallback to projectDir if git root cannot be found
-		gitRootOutput = []byte(d.projectDir)
+		gitRootOutput = []byte(projectDir)
 	}
 	gitRoot := strings.TrimSpace(string(gitRootOutput))
 
 	// Calculate relative path from project dir to git root
-	projectRelToGitRoot, err := filepath.Rel(gitRoot, d.projectDir)
+	projectRelToGitRoot, err := filepath.Rel(gitRoot, projectDir)
 	if err != nil {
 		projectRelToGitRoot = ""
 	}
