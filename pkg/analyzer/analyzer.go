@@ -274,6 +274,44 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 				}
 			}
 		}
+
+		// Find packages that propagate the interface method changes (wrapper packages)
+		// These packages call the changed interface methods and may re-expose them
+		if len(changedInterfaceMethods) > 0 {
+			propagatingPkgs := a.findPackagesThatCallInterfaceMethods(pkgPath, changedInterfaceMethods)
+			for _, propPkgPath := range propagatingPkgs {
+				// Get resources that depend on the propagating package
+				propResourceNames := a.reverseDeps[propPkgPath]
+				for _, name := range propResourceNames {
+					if _, exists := affectedMap[name]; exists {
+						continue
+					}
+
+					resource := a.getResourceByName(name)
+					if resource == nil {
+						continue
+					}
+
+					// Check if the resource actually calls the changed methods
+					// (not just any method from the propagating package)
+					resourcePkgDir := a.getPkgDir(resource.Package)
+					if resourcePkgDir == "" {
+						continue
+					}
+
+					// Check if resource calls the same method names that were changed
+					callsChangedMethods, _ := a.symbolAnalyzer.CheckMethodCallUsage(resourcePkgDir, propPkgPath, changedInterfaceMethods)
+					if callsChangedMethods {
+						affectedMap[name] = &AffectedResource{
+							Resource:        *resource,
+							Reason:          fmt.Sprintf("depends on %s (via %s)", pkgPath, propPkgPath),
+							AffectedPackage: pkgPath,
+							DependencyChain: a.getDependencyChain(resource.Package, propPkgPath),
+						}
+					}
+				}
+			}
+		}
 	}
 
 	result := make([]AffectedResource, 0, len(affectedMap))
@@ -295,6 +333,62 @@ func uniqueInterfaceMethods(methods []InterfaceMethodRange) []InterfaceMethodRan
 		}
 	}
 	return result
+}
+
+// findPackagesThatCallInterfaceMethods finds packages that import the source package
+// and call the specified interface methods. These packages "propagate" the change.
+func (a *Analyzer) findPackagesThatCallInterfaceMethods(sourcePkgPath string, methods []InterfaceMethodRange) []string {
+	if len(methods) == 0 {
+		return nil
+	}
+
+	var propagatingPkgs []string
+
+	// Find all packages that import the source package
+	for pkgPath, deps := range a.graph.deps {
+		// Skip the source package itself
+		if pkgPath == sourcePkgPath {
+			continue
+		}
+
+		// Check if this package imports the source package
+		importsSource := false
+		for _, dep := range deps {
+			if dep == sourcePkgPath {
+				importsSource = true
+				break
+			}
+		}
+
+		if !importsSource {
+			continue
+		}
+
+		// Get the directory for this package
+		pkgDir := a.getPkgDir(pkgPath)
+		if pkgDir == "" {
+			continue
+		}
+
+		// Check if this package calls any of the interface methods
+		callsMethods, _ := a.symbolAnalyzer.CheckMethodCallUsage(pkgDir, sourcePkgPath, methods)
+		if callsMethods {
+			propagatingPkgs = append(propagatingPkgs, pkgPath)
+		}
+	}
+
+	return propagatingPkgs
+}
+
+// getPkgDir returns the directory path for a package
+func (a *Analyzer) getPkgDir(pkgPath string) string {
+	// Convert module-relative package path to filesystem path
+	if strings.HasPrefix(pkgPath, a.config.ModulePath) {
+		relPath := strings.TrimPrefix(pkgPath, a.config.ModulePath)
+		relPath = strings.TrimPrefix(relPath, "/")
+		return filepath.Join(a.config.ProjectRoot, relPath)
+	}
+	return ""
 }
 
 // isResourceAffectedBySymbols checks if a resource is actually affected by the changed symbols
