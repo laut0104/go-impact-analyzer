@@ -33,3 +33,4 @@ go.work.sum
 
 # Built binary
 impact-analyzer
+.DS_Store
