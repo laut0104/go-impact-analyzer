@@ -442,6 +442,37 @@ func (s *SymbolAnalyzer) ExtractInterfaceMethodRanges(filePath string) ([]Interf
 	return ranges, nil
 }
 
+// FindInterfacesWithMethods finds interfaces in a file that contain methods with the given names
+// This is used to detect when a concrete method implementation changes, we should also
+// consider the interfaces that define those methods as affected
+func (s *SymbolAnalyzer) FindInterfacesWithMethods(filePath string, methodNames []string) ([]InterfaceMethodRange, error) {
+	if len(methodNames) == 0 {
+		return nil, nil
+	}
+
+	// Build a set of method names for quick lookup
+	methodNameSet := make(map[string]bool)
+	for _, name := range methodNames {
+		methodNameSet[name] = true
+	}
+
+	// Get all interface methods from the file
+	allInterfaceMethods, err := s.ExtractInterfaceMethodRanges(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find interfaces that have methods matching the changed method names
+	var matchingMethods []InterfaceMethodRange
+	for _, im := range allInterfaceMethods {
+		if methodNameSet[im.MethodName] {
+			matchingMethods = append(matchingMethods, im)
+		}
+	}
+
+	return matchingMethods, nil
+}
+
 // GetChangedInterfaceMethods returns the interface methods that were modified based on changed line numbers
 func (s *SymbolAnalyzer) GetChangedInterfaceMethods(filePath string, changedLines []int) ([]InterfaceMethodRange, error) {
 	if len(changedLines) == 0 {
@@ -587,10 +618,31 @@ func (s *SymbolAnalyzer) GetChangedSymbolsDetailed(filePath string, changedLines
 		return nil, err
 	}
 
-	// Get changed interface methods
+	// Get changed interface methods (from interface definitions)
 	methods, err := s.GetChangedInterfaceMethods(filePath, changedLines)
 	if err != nil {
 		return nil, err
+	}
+
+	// Find interfaces that have methods matching the changed symbols
+	// This handles the case where a concrete method implementation changes
+	// and we need to mark the interface as affected too
+	if len(symbols) > 0 {
+		interfaceMethodsFromImpl, err := s.FindInterfacesWithMethods(filePath, symbols)
+		if err == nil && len(interfaceMethodsFromImpl) > 0 {
+			// Merge with existing methods, avoiding duplicates
+			existingKeys := make(map[string]bool)
+			for _, m := range methods {
+				existingKeys[m.InterfaceName+"."+m.MethodName] = true
+			}
+			for _, m := range interfaceMethodsFromImpl {
+				key := m.InterfaceName + "." + m.MethodName
+				if !existingKeys[key] {
+					methods = append(methods, m)
+					existingKeys[key] = true
+				}
+			}
+		}
 	}
 
 	// Check if any unexported symbols were changed
