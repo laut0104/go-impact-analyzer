@@ -2,8 +2,6 @@ package analyzer
 
 import (
 	"bufio"
-	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -13,6 +11,7 @@ import (
 type DiffAnalyzer struct {
 	projectDir string
 	baseBranch string
+	gitClient  GitClient
 }
 
 // NewDiffAnalyzer creates a new DiffAnalyzer
@@ -20,6 +19,16 @@ func NewDiffAnalyzer(projectDir, baseBranch string) *DiffAnalyzer {
 	return &DiffAnalyzer{
 		projectDir: projectDir,
 		baseBranch: baseBranch,
+		gitClient:  NewGitClient(projectDir, baseBranch),
+	}
+}
+
+// NewDiffAnalyzerWithClient creates a new DiffAnalyzer with a custom GitClient
+func NewDiffAnalyzerWithClient(projectDir, baseBranch string, gitClient GitClient) *DiffAnalyzer {
+	return &DiffAnalyzer{
+		projectDir: projectDir,
+		baseBranch: baseBranch,
+		gitClient:  gitClient,
 	}
 }
 
@@ -31,67 +40,7 @@ type FileChanges struct {
 
 // GetChangedLines extracts changed line numbers for a specific file using git diff
 func (d *DiffAnalyzer) GetChangedLines(filePath string) ([]int, error) {
-	// Ensure projectDir is absolute
-	projectDir := d.projectDir
-	if !filepath.IsAbs(projectDir) {
-		var err error
-		projectDir, err = filepath.Abs(projectDir)
-		if err != nil {
-			projectDir = d.projectDir
-		}
-	}
-
-	// Convert to relative path if absolute
-	relPath := filePath
-	if filepath.IsAbs(filePath) {
-		var err error
-		relPath, err = filepath.Rel(projectDir, filePath)
-		if err != nil {
-			relPath = filePath
-		}
-	}
-
-	// Find git root directory
-	gitRootCmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	gitRootCmd.Dir = projectDir
-	gitRootOutput, err := gitRootCmd.Output()
-	if err != nil {
-		// Fallback to projectDir if git root cannot be found
-		gitRootOutput = []byte(projectDir)
-	}
-	gitRoot := strings.TrimSpace(string(gitRootOutput))
-
-	// Calculate relative path from project dir to git root
-	projectRelToGitRoot, err := filepath.Rel(gitRoot, projectDir)
-	if err != nil {
-		projectRelToGitRoot = ""
-	}
-
-	// Build the full relative path from git root
-	var gitRelPath string
-	if projectRelToGitRoot != "" && projectRelToGitRoot != "." {
-		// Check if relPath already starts with the prefix (e.g., "go/")
-		// to avoid double prefixing like "go/go/..."
-		if strings.HasPrefix(relPath, projectRelToGitRoot+"/") {
-			gitRelPath = relPath
-		} else {
-			gitRelPath = filepath.Join(projectRelToGitRoot, relPath)
-		}
-	} else {
-		gitRelPath = relPath
-	}
-
-	// Run git diff to get line-by-line changes
-	cmd := exec.Command("git", "diff", "-U0", d.baseBranch+"...HEAD", "--", gitRelPath)
-	cmd.Dir = gitRoot
-
-	output, err := cmd.Output()
-	if err != nil {
-		// If diff fails, return empty (file might be new)
-		return nil, nil
-	}
-
-	return parseUnifiedDiff(string(output))
+	return d.gitClient.GetChangedLines(filePath)
 }
 
 // parseUnifiedDiff parses unified diff output and extracts added/modified line numbers

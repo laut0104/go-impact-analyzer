@@ -4,7 +4,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -13,6 +12,7 @@ import (
 type DIAnalyzer struct {
 	modulePath  string
 	projectRoot string
+	fs          FileSystem
 }
 
 // NewDIAnalyzer creates a new DIAnalyzer
@@ -20,6 +20,16 @@ func NewDIAnalyzer(modulePath, projectRoot string) *DIAnalyzer {
 	return &DIAnalyzer{
 		modulePath:  modulePath,
 		projectRoot: projectRoot,
+		fs:          NewFileSystem(),
+	}
+}
+
+// NewDIAnalyzerWithFS creates a new DIAnalyzer with a custom FileSystem
+func NewDIAnalyzerWithFS(modulePath, projectRoot string, fs FileSystem) *DIAnalyzer {
+	return &DIAnalyzer{
+		modulePath:  modulePath,
+		projectRoot: projectRoot,
+		fs:          fs,
 	}
 }
 
@@ -42,7 +52,7 @@ func (d *DIAnalyzer) AnalyzeDIUsage(pkgDir string) (*DIUsageInfo, error) {
 		DirectImports: []string{},
 	}
 
-	entries, err := os.ReadDir(pkgDir)
+	entries, err := d.fs.ReadDir(pkgDir)
 	if err != nil {
 		return nil, err
 	}

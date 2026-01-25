@@ -4,7 +4,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"os"
 	"path/filepath"
 	"strings"
 	"unicode"
@@ -19,6 +18,8 @@ type SymbolAnalyzer struct {
 	fileSymbols map[string][]string
 	// Package path -> file paths within the package
 	packageFiles map[string][]string
+	// FileSystem for file operations
+	fs FileSystem
 }
 
 // NewSymbolAnalyzer creates a new SymbolAnalyzer
@@ -29,6 +30,19 @@ func NewSymbolAnalyzer(modulePath, projectDir string) *SymbolAnalyzer {
 		projectDir:   projectDir,
 		fileSymbols:  make(map[string][]string),
 		packageFiles: make(map[string][]string),
+		fs:           NewFileSystem(),
+	}
+}
+
+// NewSymbolAnalyzerWithFS creates a new SymbolAnalyzer with a custom FileSystem
+func NewSymbolAnalyzerWithFS(modulePath, projectDir string, fs FileSystem) *SymbolAnalyzer {
+	return &SymbolAnalyzer{
+		fset:         token.NewFileSet(),
+		modulePath:   modulePath,
+		projectDir:   projectDir,
+		fileSymbols:  make(map[string][]string),
+		packageFiles: make(map[string][]string),
+		fs:           fs,
 	}
 }
 
@@ -102,7 +116,7 @@ func (s *SymbolAnalyzer) CheckSymbolUsage(pkgDir string, targetPkgPath string, s
 	targetPkgName := filepath.Base(targetPkgPath)
 
 	// Parse all Go files in the package directory
-	entries, err := os.ReadDir(pkgDir)
+	entries, err := s.fs.ReadDir(pkgDir)
 	if err != nil {
 		return false, err
 	}
@@ -517,7 +531,7 @@ func (s *SymbolAnalyzer) CheckMethodCallUsage(pkgDir string, targetPkgPath strin
 	targetPkgName := filepath.Base(targetPkgPath)
 
 	// Parse all Go files in the package directory
-	entries, err := os.ReadDir(pkgDir)
+	entries, err := s.fs.ReadDir(pkgDir)
 	if err != nil {
 		return false, err
 	}
@@ -682,7 +696,7 @@ func (s *SymbolAnalyzer) GetChangedSymbolsDetailed(filePath string, changedLines
 
 // ExtractAllExportedSymbolsFromDir extracts all exported symbols from all Go files in a directory
 func (s *SymbolAnalyzer) ExtractAllExportedSymbolsFromDir(pkgDir string) ([]string, error) {
-	entries, err := os.ReadDir(pkgDir)
+	entries, err := s.fs.ReadDir(pkgDir)
 	if err != nil {
 		return nil, err
 	}
@@ -728,7 +742,7 @@ func (s *SymbolAnalyzer) CheckSymbolUsesSymbols(pkgDir string, targetPkgPath str
 	targetPkgName := filepath.Base(targetPkgPath)
 
 	// Parse all Go files in the package directory
-	entries, err := os.ReadDir(pkgDir)
+	entries, err := s.fs.ReadDir(pkgDir)
 	if err != nil {
 		return false, err
 	}
@@ -886,7 +900,7 @@ func (s *SymbolAnalyzer) HasUnexportedChanges(filePath string, changedLines []in
 
 // GetFactoryReturnTypes extracts return types from factory functions (functions that return interfaces)
 func (s *SymbolAnalyzer) GetFactoryReturnTypes(pkgDir string, functionNames []string) []string {
-	entries, err := os.ReadDir(pkgDir)
+	entries, err := s.fs.ReadDir(pkgDir)
 	if err != nil {
 		return nil
 	}
@@ -967,7 +981,7 @@ func (s *SymbolAnalyzer) CheckSymbolUsesInterfaceMethods(pkgDir string, targetPk
 	}
 
 	// Parse all Go files in the package directory
-	entries, err := os.ReadDir(pkgDir)
+	entries, err := s.fs.ReadDir(pkgDir)
 	if err != nil {
 		return false, err
 	}
