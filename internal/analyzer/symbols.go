@@ -100,6 +100,213 @@ func isExported(name string) bool {
 	return unicode.IsUpper(rune(name[0]))
 }
 
+// ExtractExportedSymbolsFromContent extracts exported symbols from Go source code content
+func (s *SymbolAnalyzer) ExtractExportedSymbolsFromContent(content []byte) ([]string, error) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "", content, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	var symbols []string
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch decl := n.(type) {
+		case *ast.FuncDecl:
+			if decl.Name != nil && isExported(decl.Name.Name) {
+				symbols = append(symbols, decl.Name.Name)
+			}
+		case *ast.GenDecl:
+			for _, spec := range decl.Specs {
+				switch sp := spec.(type) {
+				case *ast.TypeSpec:
+					if isExported(sp.Name.Name) {
+						symbols = append(symbols, sp.Name.Name)
+					}
+				case *ast.ValueSpec:
+					for _, name := range sp.Names {
+						if isExported(name.Name) {
+							symbols = append(symbols, name.Name)
+						}
+					}
+				}
+			}
+		}
+		return true
+	})
+
+	return symbols, nil
+}
+
+// ExtractConstantRangesFromContent extracts constant/variable ranges from Go source code content
+func (s *SymbolAnalyzer) ExtractConstantRangesFromContent(content []byte) ([]FunctionRange, error) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "", content, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	var ranges []FunctionRange
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		genDecl, ok := n.(*ast.GenDecl)
+		if !ok {
+			return true
+		}
+
+		if genDecl.Tok != token.CONST && genDecl.Tok != token.VAR {
+			return true
+		}
+
+		for _, spec := range genDecl.Specs {
+			valueSpec, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+
+			for _, name := range valueSpec.Names {
+				if !isExported(name.Name) {
+					continue
+				}
+
+				startPos := fset.Position(valueSpec.Pos())
+				endPos := fset.Position(valueSpec.End())
+
+				ranges = append(ranges, FunctionRange{
+					Name:      name.Name,
+					StartLine: startPos.Line,
+					EndLine:   endPos.Line,
+				})
+			}
+		}
+
+		return true
+	})
+
+	return ranges, nil
+}
+
+// ExtractFunctionRangesFromContent extracts function ranges from Go source code content
+func (s *SymbolAnalyzer) ExtractFunctionRangesFromContent(content []byte) ([]FunctionRange, error) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "", content, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	var ranges []FunctionRange
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		funcDecl, ok := n.(*ast.FuncDecl)
+		if !ok {
+			return true
+		}
+
+		if funcDecl.Name == nil || !isExported(funcDecl.Name.Name) {
+			return true
+		}
+
+		startPos := fset.Position(funcDecl.Pos())
+		endPos := fset.Position(funcDecl.End())
+
+		ranges = append(ranges, FunctionRange{
+			Name:      funcDecl.Name.Name,
+			StartLine: startPos.Line,
+			EndLine:   endPos.Line,
+		})
+
+		return true
+	})
+
+	return ranges, nil
+}
+
+// ExtractTypeRangesFromContent extracts type ranges from Go source code content
+func (s *SymbolAnalyzer) ExtractTypeRangesFromContent(content []byte) ([]FunctionRange, error) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "", content, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	var ranges []FunctionRange
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		genDecl, ok := n.(*ast.GenDecl)
+		if !ok {
+			return true
+		}
+
+		for _, spec := range genDecl.Specs {
+			typeSpec, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+
+			if !isExported(typeSpec.Name.Name) {
+				continue
+			}
+
+			startPos := fset.Position(genDecl.Pos())
+			endPos := fset.Position(genDecl.End())
+
+			ranges = append(ranges, FunctionRange{
+				Name:      typeSpec.Name.Name,
+				StartLine: startPos.Line,
+				EndLine:   endPos.Line,
+			})
+		}
+
+		return true
+	})
+
+	return ranges, nil
+}
+
+// GetDeletedSymbols returns symbols that were deleted based on old file content and deleted line numbers
+func (s *SymbolAnalyzer) GetDeletedSymbols(oldContent []byte, deletedLines []int) ([]string, error) {
+	if len(deletedLines) == 0 {
+		return nil, nil
+	}
+
+	// Get all symbol ranges from the old content
+	funcRanges, err := s.ExtractFunctionRangesFromContent(oldContent)
+	if err != nil {
+		return nil, err
+	}
+
+	typeRanges, err := s.ExtractTypeRangesFromContent(oldContent)
+	if err != nil {
+		return nil, err
+	}
+
+	constRanges, err := s.ExtractConstantRangesFromContent(oldContent)
+	if err != nil {
+		return nil, err
+	}
+
+	allRanges := append(funcRanges, typeRanges...)
+	allRanges = append(allRanges, constRanges...)
+
+	// Find which symbols were affected by the deleted lines
+	deletedSymbols := make(map[string]bool)
+	for _, line := range deletedLines {
+		for _, r := range allRanges {
+			if line >= r.StartLine && line <= r.EndLine {
+				deletedSymbols[r.Name] = true
+			}
+		}
+	}
+
+	// Convert to slice
+	result := make([]string, 0, len(deletedSymbols))
+	for sym := range deletedSymbols {
+		result = append(result, sym)
+	}
+
+	return result, nil
+}
+
 // CheckSymbolUsage checks if a package uses any of the given symbols from another package
 func (s *SymbolAnalyzer) CheckSymbolUsage(pkgDir string, targetPkgPath string, symbols []string) (bool, error) {
 	if len(symbols) == 0 {

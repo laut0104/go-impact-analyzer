@@ -202,9 +202,9 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 		var infraSymbols []string
 
 		for _, fi := range files {
-			// Get changed line numbers from git diff
-			changedLines, err := a.diffAnalyzer.GetChangedLines(fi.origPath)
-			if err != nil || len(changedLines) == 0 {
+			// Get changed line numbers from git diff (including deleted lines)
+			diffResult, err := a.diffAnalyzer.GetChangedLinesWithDeleted(fi.origPath)
+			if err != nil || (len(diffResult.AddedLines) == 0 && len(diffResult.DeletedLines) == 0) {
 				// Fallback: if we can't get diff info, use all exported symbols
 				symbols, err := a.symbolAnalyzer.ExtractExportedSymbols(fi.absPath)
 				if err == nil {
@@ -217,26 +217,42 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 				continue
 			}
 
-			// Get detailed symbol info including interface methods
-			symbolInfo, err := a.symbolAnalyzer.GetChangedSymbolsDetailed(fi.absPath, changedLines)
-			if err != nil {
-				// Fallback to all symbols on error
-				allSymbols, _ := a.symbolAnalyzer.ExtractExportedSymbols(fi.absPath)
-				if fi.isInfrastructure {
-					infraSymbols = append(infraSymbols, allSymbols...)
+			// Get symbols from added/modified lines in the current file
+			if len(diffResult.AddedLines) > 0 {
+				symbolInfo, err := a.symbolAnalyzer.GetChangedSymbolsDetailed(fi.absPath, diffResult.AddedLines)
+				if err != nil {
+					// Fallback to all symbols on error
+					allSymbols, _ := a.symbolAnalyzer.ExtractExportedSymbols(fi.absPath)
+					if fi.isInfrastructure {
+						infraSymbols = append(infraSymbols, allSymbols...)
+					} else {
+						changedSymbols = append(changedSymbols, allSymbols...)
+					}
 				} else {
-					changedSymbols = append(changedSymbols, allSymbols...)
+					if fi.isInfrastructure {
+						infraSymbols = append(infraSymbols, symbolInfo.Symbols...)
+					} else {
+						changedSymbols = append(changedSymbols, symbolInfo.Symbols...)
+						changedInterfaceMethods = append(changedInterfaceMethods, symbolInfo.InterfaceMethods...)
+						if symbolInfo.HasUnexportedChanges {
+							hasUnexportedChanges = true
+						}
+					}
 				}
-				continue
 			}
 
-			if fi.isInfrastructure {
-				infraSymbols = append(infraSymbols, symbolInfo.Symbols...)
-			} else {
-				changedSymbols = append(changedSymbols, symbolInfo.Symbols...)
-				changedInterfaceMethods = append(changedInterfaceMethods, symbolInfo.InterfaceMethods...)
-				if symbolInfo.HasUnexportedChanges {
-					hasUnexportedChanges = true
+			// Get symbols from deleted lines by parsing the base branch version
+			if len(diffResult.DeletedLines) > 0 {
+				oldContent, err := a.config.GitClient.GetFileContentAtBase(fi.origPath)
+				if err == nil && len(oldContent) > 0 {
+					deletedSymbols, err := a.symbolAnalyzer.GetDeletedSymbols(oldContent, diffResult.DeletedLines)
+					if err == nil {
+						if fi.isInfrastructure {
+							infraSymbols = append(infraSymbols, deletedSymbols...)
+						} else {
+							changedSymbols = append(changedSymbols, deletedSymbols...)
+						}
+					}
 				}
 			}
 		}

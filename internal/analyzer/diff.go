@@ -38,20 +38,41 @@ type FileChanges struct {
 	ChangedLines []int // Line numbers that were added or modified
 }
 
+// DiffResult contains both added and deleted line information
+type DiffResult struct {
+	AddedLines   []int // Line numbers in the new file that were added/modified
+	DeletedLines []int // Line numbers in the old file that were deleted
+}
+
 // GetChangedLines extracts changed line numbers for a specific file using git diff
 func (d *DiffAnalyzer) GetChangedLines(filePath string) ([]int, error) {
 	return d.gitClient.GetChangedLines(filePath)
 }
 
+// GetChangedLinesWithDeleted extracts both added and deleted line numbers for a specific file
+func (d *DiffAnalyzer) GetChangedLinesWithDeleted(filePath string) (*DiffResult, error) {
+	return d.gitClient.GetChangedLinesWithDeleted(filePath)
+}
+
 // parseUnifiedDiff parses unified diff output and extracts added/modified line numbers
 func parseUnifiedDiff(diffOutput string) ([]int, error) {
-	var changedLines []int
+	result, err := parseUnifiedDiffWithDeleted(diffOutput)
+	if err != nil {
+		return nil, err
+	}
+	return result.AddedLines, nil
+}
+
+// parseUnifiedDiffWithDeleted parses unified diff output and extracts both added and deleted line numbers
+func parseUnifiedDiffWithDeleted(diffOutput string) (*DiffResult, error) {
+	result := &DiffResult{}
 
 	// Regex to match hunk headers: @@ -old_start,old_count +new_start,new_count @@
-	// We're interested in the new file line numbers (after +)
-	hunkRegex := regexp.MustCompile(`@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
+	// We need both old and new line numbers
+	hunkRegex := regexp.MustCompile(`@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@`)
 
 	scanner := bufio.NewScanner(strings.NewReader(diffOutput))
+	currentOldLine := 0
 	currentNewLine := 0
 	inHunk := false
 
@@ -60,8 +81,10 @@ func parseUnifiedDiff(diffOutput string) ([]int, error) {
 
 		// Check for hunk header
 		if matches := hunkRegex.FindStringSubmatch(line); matches != nil {
-			startLine, _ := strconv.Atoi(matches[1])
-			currentNewLine = startLine
+			oldStart, _ := strconv.Atoi(matches[1])
+			newStart, _ := strconv.Atoi(matches[3])
+			currentOldLine = oldStart
+			currentNewLine = newStart
 			inHunk = true
 			continue
 		}
@@ -78,24 +101,27 @@ func parseUnifiedDiff(diffOutput string) ([]int, error) {
 
 		// Added line (starts with +)
 		if strings.HasPrefix(line, "+") {
-			changedLines = append(changedLines, currentNewLine)
+			result.AddedLines = append(result.AddedLines, currentNewLine)
 			currentNewLine++
 			continue
 		}
 
-		// Removed line (starts with -) - don't increment new line counter
+		// Removed line (starts with -) - track old line number
 		if strings.HasPrefix(line, "-") {
+			result.DeletedLines = append(result.DeletedLines, currentOldLine)
+			currentOldLine++
 			continue
 		}
 
-		// Context line (starts with space) - increment counter but don't record
+		// Context line (starts with space) - increment both counters but don't record
 		if strings.HasPrefix(line, " ") {
+			currentOldLine++
 			currentNewLine++
 			continue
 		}
 	}
 
-	return changedLines, nil
+	return result, nil
 }
 
 // GetAllChangedLines returns changed lines for multiple files

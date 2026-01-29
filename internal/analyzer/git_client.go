@@ -123,3 +123,114 @@ func (g *execGitClient) GetChangedLines(filePath string) ([]int, error) {
 
 	return parseUnifiedDiff(string(output))
 }
+
+// GetChangedLinesWithDeleted returns both added and deleted line numbers for a specific file
+func (g *execGitClient) GetChangedLinesWithDeleted(filePath string) (*DiffResult, error) {
+	// Ensure projectDir is absolute
+	projectDir := g.projectDir
+	if !filepath.IsAbs(projectDir) {
+		var err error
+		projectDir, err = filepath.Abs(projectDir)
+		if err != nil {
+			projectDir = g.projectDir
+		}
+	}
+
+	// Convert to relative path if absolute
+	relPath := filePath
+	if filepath.IsAbs(filePath) {
+		var err error
+		relPath, err = filepath.Rel(projectDir, filePath)
+		if err != nil {
+			relPath = filePath
+		}
+	}
+
+	// Find git root directory
+	gitRoot, err := g.GetRootDir()
+	if err != nil {
+		gitRoot = projectDir
+	}
+
+	// Calculate relative path from project dir to git root
+	projectRelToGitRoot, err := filepath.Rel(gitRoot, projectDir)
+	if err != nil {
+		projectRelToGitRoot = ""
+	}
+
+	// Build the full relative path from git root
+	var gitRelPath string
+	if projectRelToGitRoot != "" && projectRelToGitRoot != "." {
+		if strings.HasPrefix(relPath, projectRelToGitRoot+"/") {
+			gitRelPath = relPath
+		} else {
+			gitRelPath = filepath.Join(projectRelToGitRoot, relPath)
+		}
+	} else {
+		gitRelPath = relPath
+	}
+
+	// Run git diff to get line-by-line changes
+	cmd := exec.Command("git", "diff", "-U0", g.baseBranch+"...HEAD", "--", gitRelPath)
+	cmd.Dir = gitRoot
+
+	output, err := cmd.Output()
+	if err != nil {
+		return &DiffResult{}, nil
+	}
+
+	return parseUnifiedDiffWithDeleted(string(output))
+}
+
+// GetFileContentAtBase returns the content of a file at the base branch
+func (g *execGitClient) GetFileContentAtBase(filePath string) ([]byte, error) {
+	// Ensure projectDir is absolute
+	projectDir := g.projectDir
+	if !filepath.IsAbs(projectDir) {
+		var err error
+		projectDir, err = filepath.Abs(projectDir)
+		if err != nil {
+			projectDir = g.projectDir
+		}
+	}
+
+	// Convert to relative path if absolute
+	relPath := filePath
+	if filepath.IsAbs(filePath) {
+		var err error
+		relPath, err = filepath.Rel(projectDir, filePath)
+		if err != nil {
+			relPath = filePath
+		}
+	}
+
+	// Find git root directory
+	gitRoot, err := g.GetRootDir()
+	if err != nil {
+		gitRoot = projectDir
+	}
+
+	// Calculate relative path from project dir to git root
+	projectRelToGitRoot, err := filepath.Rel(gitRoot, projectDir)
+	if err != nil {
+		projectRelToGitRoot = ""
+	}
+
+	// Build the full relative path from git root
+	var gitRelPath string
+	if projectRelToGitRoot != "" && projectRelToGitRoot != "." {
+		if strings.HasPrefix(relPath, projectRelToGitRoot+"/") {
+			gitRelPath = relPath
+		} else {
+			gitRelPath = filepath.Join(projectRelToGitRoot, relPath)
+		}
+	} else {
+		gitRelPath = relPath
+	}
+
+	// Get file content at base branch
+	cmd := exec.Command("git", "show", g.baseBranch+":"+gitRelPath)
+	cmd.Dir = gitRoot
+
+	return cmd.Output()
+}

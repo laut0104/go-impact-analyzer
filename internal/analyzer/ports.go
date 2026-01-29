@@ -8,8 +8,12 @@ type GitClient interface {
 	GetChangedFiles(baseBranch string) ([]string, error)
 	// GetChangedLines returns changed line numbers for a specific file
 	GetChangedLines(filePath string) ([]int, error)
+	// GetChangedLinesWithDeleted returns both added and deleted line numbers for a specific file
+	GetChangedLinesWithDeleted(filePath string) (*DiffResult, error)
 	// GetRootDir returns the git repository root directory
 	GetRootDir() (string, error)
+	// GetFileContentAtBase returns the content of a file at the base branch
+	GetFileContentAtBase(filePath string) ([]byte, error)
 }
 
 // GoListClient abstracts go list command for testability
