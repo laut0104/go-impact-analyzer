@@ -5,7 +5,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -28,6 +27,12 @@ type Config struct {
 	// Changes to these files alone don't affect resources unless the exported symbols they define are used
 	// Example: ["sqlc/db.go", "sqlc/models.go"]
 	InfrastructureFiles []string
+	// GitClient is the git client for git operations (optional, defaults to exec-based client)
+	GitClient GitClient
+	// GoListClient is the go list client for package listing (optional, defaults to exec-based client)
+	GoListClient GoListClient
+	// FileSystem is the file system abstraction (optional, defaults to os-based implementation)
+	FileSystem FileSystem
 }
 
 // Analyzer analyzes dependencies and identifies affected resources
@@ -41,6 +46,8 @@ type Analyzer struct {
 	resources      []Resource
 	// Package path -> resource names that depend on it
 	reverseDeps map[string][]string
+	// FileSystem for file operations
+	fs FileSystem
 }
 
 // NewAnalyzer creates a new Analyzer with the given configuration
@@ -52,14 +59,29 @@ func NewAnalyzer(cfg Config) *Analyzer {
 		cfg.BaseBranch = "origin/main"
 	}
 
+	// Set default implementations if not provided
+	if cfg.FileSystem == nil {
+		cfg.FileSystem = NewFileSystem()
+	}
+	if cfg.GitClient == nil {
+		cfg.GitClient = NewGitClient(cfg.ProjectRoot, cfg.BaseBranch)
+	}
+	if cfg.GoListClient == nil {
+		cfg.GoListClient = NewGoListClient()
+	}
+
+	// Append FileSystem option to ExtractorOptions
+	extractorOpts := append(cfg.ExtractorOptions, WithFileSystem(cfg.FileSystem))
+
 	return &Analyzer{
 		config:         cfg,
-		graph:          NewDependencyGraph(cfg.ModulePath),
-		extractor:      NewResourceExtractor(cfg.ModulePath, cfg.ExtractorOptions...),
-		symbolAnalyzer: NewSymbolAnalyzer(cfg.ModulePath, cfg.ProjectRoot),
-		diffAnalyzer:   NewDiffAnalyzer(cfg.ProjectRoot, cfg.BaseBranch),
-		diAnalyzer:     NewDIAnalyzer(cfg.ModulePath, cfg.ProjectRoot),
+		graph:          NewDependencyGraphWithClient(cfg.ModulePath, cfg.GoListClient),
+		extractor:      NewResourceExtractor(cfg.ModulePath, extractorOpts...),
+		symbolAnalyzer: NewSymbolAnalyzerWithFS(cfg.ModulePath, cfg.ProjectRoot, cfg.FileSystem),
+		diffAnalyzer:   NewDiffAnalyzerWithClient(cfg.ProjectRoot, cfg.BaseBranch, cfg.GitClient),
+		diAnalyzer:     NewDIAnalyzerWithFS(cfg.ModulePath, cfg.ProjectRoot, cfg.FileSystem),
 		reverseDeps:    make(map[string][]string),
+		fs:             cfg.FileSystem,
 	}
 }
 
@@ -180,9 +202,9 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 		var infraSymbols []string
 
 		for _, fi := range files {
-			// Get changed line numbers from git diff
-			changedLines, err := a.diffAnalyzer.GetChangedLines(fi.origPath)
-			if err != nil || len(changedLines) == 0 {
+			// Get changed line numbers from git diff (including deleted lines)
+			diffResult, err := a.diffAnalyzer.GetChangedLinesWithDeleted(fi.origPath)
+			if err != nil || (len(diffResult.AddedLines) == 0 && len(diffResult.DeletedLines) == 0) {
 				// Fallback: if we can't get diff info, use all exported symbols
 				symbols, err := a.symbolAnalyzer.ExtractExportedSymbols(fi.absPath)
 				if err == nil {
@@ -195,26 +217,42 @@ func (a *Analyzer) GetAffectedResources(changedFiles []string) []AffectedResourc
 				continue
 			}
 
-			// Get detailed symbol info including interface methods
-			symbolInfo, err := a.symbolAnalyzer.GetChangedSymbolsDetailed(fi.absPath, changedLines)
-			if err != nil {
-				// Fallback to all symbols on error
-				allSymbols, _ := a.symbolAnalyzer.ExtractExportedSymbols(fi.absPath)
-				if fi.isInfrastructure {
-					infraSymbols = append(infraSymbols, allSymbols...)
+			// Get symbols from added/modified lines in the current file
+			if len(diffResult.AddedLines) > 0 {
+				symbolInfo, err := a.symbolAnalyzer.GetChangedSymbolsDetailed(fi.absPath, diffResult.AddedLines)
+				if err != nil {
+					// Fallback to all symbols on error
+					allSymbols, _ := a.symbolAnalyzer.ExtractExportedSymbols(fi.absPath)
+					if fi.isInfrastructure {
+						infraSymbols = append(infraSymbols, allSymbols...)
+					} else {
+						changedSymbols = append(changedSymbols, allSymbols...)
+					}
 				} else {
-					changedSymbols = append(changedSymbols, allSymbols...)
+					if fi.isInfrastructure {
+						infraSymbols = append(infraSymbols, symbolInfo.Symbols...)
+					} else {
+						changedSymbols = append(changedSymbols, symbolInfo.Symbols...)
+						changedInterfaceMethods = append(changedInterfaceMethods, symbolInfo.InterfaceMethods...)
+						if symbolInfo.HasUnexportedChanges {
+							hasUnexportedChanges = true
+						}
+					}
 				}
-				continue
 			}
 
-			if fi.isInfrastructure {
-				infraSymbols = append(infraSymbols, symbolInfo.Symbols...)
-			} else {
-				changedSymbols = append(changedSymbols, symbolInfo.Symbols...)
-				changedInterfaceMethods = append(changedInterfaceMethods, symbolInfo.InterfaceMethods...)
-				if symbolInfo.HasUnexportedChanges {
-					hasUnexportedChanges = true
+			// Get symbols from deleted lines by parsing the base branch version
+			if len(diffResult.DeletedLines) > 0 {
+				oldContent, err := a.config.GitClient.GetFileContentAtBase(fi.origPath)
+				if err == nil && len(oldContent) > 0 {
+					deletedSymbols, err := a.symbolAnalyzer.GetDeletedSymbols(oldContent, diffResult.DeletedLines)
+					if err == nil {
+						if fi.isInfrastructure {
+							infraSymbols = append(infraSymbols, deletedSymbols...)
+						} else {
+							changedSymbols = append(changedSymbols, deletedSymbols...)
+						}
+					}
 				}
 			}
 		}
@@ -780,7 +818,7 @@ func (a *Analyzer) isResourceAffectedByAggregatorChange(resource *Resource, chan
 func (a *Analyzer) extractReferencedProviders(pkgDir string, changedSymbols []string) []string {
 	var providers []string
 
-	entries, err := os.ReadDir(pkgDir)
+	entries, err := a.fs.ReadDir(pkgDir)
 	if err != nil {
 		return providers
 	}
@@ -880,7 +918,7 @@ func (a *Analyzer) extractProvidersFromExpr(expr ast.Expr, importMap map[string]
 func (a *Analyzer) findInterfaceDefinitionPackages(providerPkgDir string, interfaceNames []string) map[string][]string {
 	result := make(map[string][]string)
 
-	entries, err := os.ReadDir(providerPkgDir)
+	entries, err := a.fs.ReadDir(providerPkgDir)
 	if err != nil {
 		return result
 	}

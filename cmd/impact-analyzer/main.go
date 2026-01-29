@@ -2,16 +2,23 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
-	"github.com/laut0104/go-impact-analyzer/pkg/analyzer"
-	"github.com/laut0104/go-impact-analyzer/pkg/output"
+	"github.com/laut0104/go-impact-analyzer/internal/analyzer"
 )
+
+// AnalysisResult represents the analysis result
+type AnalysisResult struct {
+	ChangedPackages   []string                    `json:"changed_packages,omitempty"`
+	ChangedFiles      []string                    `json:"changed_files,omitempty"`
+	AffectedResources []analyzer.AffectedResource `json:"affected_resources"`
+	TotalResources    int                         `json:"total_resources"`
+}
 
 func main() {
 	// Flag definitions
@@ -82,17 +89,9 @@ func main() {
 	// Resource list mode
 	if listResources {
 		if jsonOutput {
-			writer := output.NewJSONWriter(os.Stdout, true)
-			if err := writer.WriteResourceList(a.GetResources()); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
+			printResourceListJSON(a.GetResources())
 		} else {
-			writer := output.NewTextWriter(os.Stdout)
-			if err := writer.WriteResourceList(a.GetResources()); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
+			printResourceListText(a.GetResources())
 		}
 		return
 	}
@@ -101,17 +100,22 @@ func main() {
 	var changedFiles []string
 
 	if gitDiff {
-		var err error
-		// Get git repository root for git diff
-		gitRoot, err := getGitRoot(projectRoot)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to detect git root: %v\n", err)
-			os.Exit(1)
-		}
-		changedFiles, err = getGitDiffFiles(gitRoot, baseBranch, pathPrefix)
+		// Use GitClient for git operations
+		gitClient := analyzer.NewGitClient(projectRoot, baseBranch)
+		allFiles, err := gitClient.GetChangedFiles(baseBranch)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: failed to get git diff: %v\n", err)
 			os.Exit(1)
+		}
+		// Filter files by path prefix and .go extension
+		for _, file := range allFiles {
+			if !strings.HasSuffix(file, ".go") {
+				continue
+			}
+			if pathPrefix != "" && !strings.HasPrefix(file, pathPrefix) {
+				continue
+			}
+			changedFiles = append(changedFiles, file)
 		}
 	} else if files != "" {
 		changedFiles = strings.Split(files, ",")
@@ -121,7 +125,7 @@ func main() {
 	} else if packages != "" {
 		// Package specification mode
 		pkgList := strings.Split(packages, ",")
-		result := &output.AnalysisResult{
+		result := &AnalysisResult{
 			ChangedPackages:   pkgList,
 			AffectedResources: make([]analyzer.AffectedResource, 0),
 			TotalResources:    len(a.GetResources()),
@@ -136,7 +140,7 @@ func main() {
 		// Remove duplicates
 		result.AffectedResources = uniqueAffectedResources(result.AffectedResources)
 
-		outputResult(result, jsonOutput)
+		printResult(result, jsonOutput)
 		return
 	} else {
 		// Read from stdin
@@ -167,29 +171,131 @@ func main() {
 	// Impact analysis
 	affected := a.GetAffectedResources(changedFiles)
 
-	result := &output.AnalysisResult{
+	result := &AnalysisResult{
 		ChangedFiles:      changedFiles,
 		AffectedResources: affected,
 		TotalResources:    len(a.GetResources()),
 	}
 
-	outputResult(result, jsonOutput)
+	printResult(result, jsonOutput)
 }
 
-func outputResult(result *output.AnalysisResult, jsonOutput bool) {
+// printResult outputs analysis result
+func printResult(result *AnalysisResult, jsonOutput bool) {
 	if jsonOutput {
-		writer := output.NewJSONWriter(os.Stdout, true)
-		if err := writer.WriteAnalysisResult(result); err != nil {
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(result); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+		return
+	}
+
+	fmt.Println("=== Impact Analysis Result ===")
+	fmt.Println()
+
+	if len(result.ChangedFiles) > 0 {
+		fmt.Println("Changed Files:")
+		for _, f := range result.ChangedFiles {
+			fmt.Printf("  - %s\n", f)
+		}
+		fmt.Println()
+	}
+
+	if len(result.ChangedPackages) > 0 {
+		fmt.Println("Changed Packages:")
+		for _, p := range result.ChangedPackages {
+			fmt.Printf("  - %s\n", p)
+		}
+		fmt.Println()
+	}
+
+	fmt.Printf("Affected Resources (%d):\n", len(result.AffectedResources))
+	if len(result.AffectedResources) == 0 {
+		fmt.Println("  (none)")
 	} else {
-		writer := output.NewTextWriter(os.Stdout)
-		if err := writer.WriteAnalysisResult(result); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+		for _, r := range result.AffectedResources {
+			fmt.Printf("  [%s] %s\n", r.Type, r.Name)
+			fmt.Printf("    Reason: %s\n", r.Reason)
+			if len(r.DependencyChain) > 0 {
+				fmt.Printf("    Chain: %s\n", strings.Join(r.DependencyChain, " -> "))
+			}
 		}
 	}
+}
+
+// printResourceListJSON outputs resource list in JSON format
+func printResourceListJSON(resources []analyzer.Resource) {
+	result := struct {
+		Resources []analyzer.Resource `json:"resources"`
+		Total     int                 `json:"total"`
+	}{
+		Resources: resources,
+		Total:     len(resources),
+	}
+
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(result); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// printResourceListText outputs resource list in text format
+func printResourceListText(resources []analyzer.Resource) {
+	fmt.Println("=== Resources ===")
+	fmt.Println()
+
+	// Classify by type
+	var apiResources, jobResources, workerResources []analyzer.Resource
+
+	for _, r := range resources {
+		switch r.Type {
+		case analyzer.ResourceTypeAPI:
+			apiResources = append(apiResources, r)
+		case analyzer.ResourceTypeJob:
+			jobResources = append(jobResources, r)
+		case analyzer.ResourceTypeWorker:
+			workerResources = append(workerResources, r)
+		}
+	}
+
+	if len(apiResources) > 0 {
+		fmt.Printf("API Services (%d):\n", len(apiResources))
+		for _, r := range apiResources {
+			fmt.Printf("  - %s: %s\n", r.Name, r.Description)
+			if r.Package != "" {
+				fmt.Printf("    Package: %s\n", r.Package)
+			}
+		}
+		fmt.Println()
+	}
+
+	if len(jobResources) > 0 {
+		fmt.Printf("Jobs (%d):\n", len(jobResources))
+		for _, r := range jobResources {
+			fmt.Printf("  - %s: %s\n", r.Name, r.Description)
+			if r.Package != "" {
+				fmt.Printf("    Package: %s\n", r.Package)
+			}
+		}
+		fmt.Println()
+	}
+
+	if len(workerResources) > 0 {
+		fmt.Printf("Workers (%d):\n", len(workerResources))
+		for _, r := range workerResources {
+			fmt.Printf("  - %s: %s\n", r.Name, r.Description)
+			if r.Package != "" {
+				fmt.Printf("    Package: %s\n", r.Package)
+			}
+		}
+		fmt.Println()
+	}
+
+	fmt.Printf("Total: %d resources\n", len(resources))
 }
 
 // detectProjectRoot detects the project root
@@ -238,49 +344,6 @@ func detectModulePath(projectRoot string) (string, error) {
 	}
 
 	return "", fmt.Errorf("module directive not found in go.mod")
-}
-
-// getGitRoot finds the git repository root
-func getGitRoot(startDir string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	cmd.Dir = startDir
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("not a git repository: %w", err)
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-// getGitDiffFiles gets changed file list from git diff
-func getGitDiffFiles(gitRoot, baseBranch, pathPrefix string) ([]string, error) {
-	cmd := exec.Command("git", "diff", "--name-only", baseBranch+"...HEAD")
-	cmd.Dir = gitRoot
-	out, err := cmd.Output()
-	if err != nil {
-		// Fallback: simple diff
-		cmd = exec.Command("git", "diff", "--name-only", baseBranch)
-		cmd.Dir = gitRoot
-		out, err = cmd.Output()
-		if err != nil {
-			return nil, fmt.Errorf("git diff failed: %w", err)
-		}
-	}
-
-	var files []string
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || !strings.HasSuffix(line, ".go") {
-			continue
-		}
-		// Filter by path prefix if specified (e.g., only include files under "go/")
-		if pathPrefix != "" {
-			if !strings.HasPrefix(line, pathPrefix) {
-				continue
-			}
-		}
-		files = append(files, line)
-	}
-	return files, nil
 }
 
 // uniqueAffectedResources removes duplicates

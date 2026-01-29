@@ -17,6 +17,8 @@ type ResourceExtractor struct {
 	cmdPackageSuffix string
 	// resourceFileMap maps filename to ResourceType
 	resourceFileMap map[string]ResourceType
+	// FileSystem for file operations
+	fs FileSystem
 }
 
 // ExtractorOption is a function that configures ResourceExtractor
@@ -36,6 +38,13 @@ func WithResourceFileMap(m map[string]ResourceType) ExtractorOption {
 	}
 }
 
+// WithFileSystem sets a custom FileSystem
+func WithFileSystem(fs FileSystem) ExtractorOption {
+	return func(e *ResourceExtractor) {
+		e.fs = fs
+	}
+}
+
 // NewResourceExtractor creates a new ResourceExtractor
 func NewResourceExtractor(modulePath string, opts ...ExtractorOption) *ResourceExtractor {
 	e := &ResourceExtractor{
@@ -47,6 +56,7 @@ func NewResourceExtractor(modulePath string, opts ...ExtractorOption) *ResourceE
 			"job.go":    ResourceTypeJob,
 			"worker.go": ResourceTypeWorker,
 		},
+		fs: NewFileSystem(),
 	}
 
 	for _, opt := range opts {
@@ -65,7 +75,7 @@ func (e *ResourceExtractor) ExtractFromDir(dir string) ([]Resource, error) {
 		filePath := filepath.Join(dir, fileName)
 
 		// Check if file exists
-		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		if _, err := e.fs.Stat(filePath); os.IsNotExist(err) {
 			continue
 		}
 

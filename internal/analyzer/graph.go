@@ -1,9 +1,7 @@
 package analyzer
 
 import (
-	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
 )
 
@@ -13,43 +11,36 @@ type DependencyGraph struct {
 	deps map[string][]string
 	// Module path (project root path)
 	modulePath string
-}
-
-// goListPackage represents the output of go list -json
-type goListPackage struct {
-	ImportPath string   `json:"ImportPath"`
-	Imports    []string `json:"Imports"`
+	// GoListClient for listing packages
+	goListClient GoListClient
 }
 
 // NewDependencyGraph creates a new dependency graph
 func NewDependencyGraph(modulePath string) *DependencyGraph {
 	return &DependencyGraph{
-		deps:       make(map[string][]string),
-		modulePath: modulePath,
+		deps:         make(map[string][]string),
+		modulePath:   modulePath,
+		goListClient: NewGoListClient(),
+	}
+}
+
+// NewDependencyGraphWithClient creates a new dependency graph with a custom GoListClient
+func NewDependencyGraphWithClient(modulePath string, goListClient GoListClient) *DependencyGraph {
+	return &DependencyGraph{
+		deps:         make(map[string][]string),
+		modulePath:   modulePath,
+		goListClient: goListClient,
 	}
 }
 
 // Build loads packages matching the patterns and builds the dependency graph
 func (g *DependencyGraph) Build(dir string, patterns ...string) error {
-	// Use go list -json which is faster than go/packages
-	args := append([]string{"list", "-json"}, patterns...)
-	cmd := exec.Command("go", args...)
-	cmd.Dir = dir
-
-	output, err := cmd.Output()
+	packages, err := g.goListClient.ListPackages(dir, patterns...)
 	if err != nil {
 		return fmt.Errorf("failed to run go list: %w", err)
 	}
 
-	// go list -json outputs multiple JSON objects (not an array)
-	decoder := json.NewDecoder(strings.NewReader(string(output)))
-	for decoder.More() {
-		var pkg goListPackage
-		if err := decoder.Decode(&pkg); err != nil {
-			// Skip invalid JSON
-			continue
-		}
-
+	for _, pkg := range packages {
 		// Only track packages within the project
 		if !g.isProjectPackage(pkg.ImportPath) {
 			continue

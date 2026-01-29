@@ -11,11 +11,11 @@ const (
 
 // Resource represents a CLI command (service/job/worker)
 type Resource struct {
-	Name        string       `json:"name"`         // Command name (e.g., "api-gateway", "update-price")
-	Type        ResourceType `json:"type"`         // "api", "job", "worker"
-	Package     string       `json:"package"`      // Direct dependency package (e.g., "github.com/.../job/update-price")
-	SourceFile  string       `json:"source_file"`  // Source file where defined
-	Description string       `json:"description"`  // Command description (Short)
+	Name        string       `json:"name"`        // Command name (e.g., "api-gateway", "update-price")
+	Type        ResourceType `json:"type"`        // "api", "job", "worker"
+	Package     string       `json:"package"`     // Direct dependency package (e.g., "github.com/.../job/update-price")
+	SourceFile  string       `json:"source_file"` // Source file where defined
+	Description string       `json:"description"` // Command description (Short)
 }
 
 // AffectedResource represents information about an affected resource
